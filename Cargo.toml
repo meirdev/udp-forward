@@ -1,0 +1,16 @@
+[package]
+name = "udp-forward"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.5.60", features = ["derive"] }
+env_logger = "0.11.9"
+libc = "0.2.180"
+log = "0.4.29"
+nix = { version = "0.31.1", features = ["process"] }
+num_cpus = "1.17.0"
+pnet_packet = "0.35.0"
+prometheus = "0.14.0"
+socket2 = { version = "0.6.2", features = ["all"] }
