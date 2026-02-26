@@ -12,6 +12,15 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::cli::Args;
 
+const SO_ATTACH_FILTER: libc::c_int = 26;
+
+const IP_HEADER_LEN: usize = 20;
+const IPV6_HEADER_LEN: usize = 40;
+const UDP_HEADER_LEN: usize = 8;
+
+// Ethernet protocol for IPv6
+const ETH_P_IPV6: u16 = 0x86dd;
+
 #[repr(C)]
 struct SockFilter {
     code: u16,
@@ -26,11 +35,16 @@ struct SockFprog {
     filter: *const SockFilter,
 }
 
-const SO_ATTACH_FILTER: libc::c_int = 26;
-
-const IP_HEADER_LEN: usize = 20;
-const IPV6_HEADER_LEN: usize = 40;
-const UDP_HEADER_LEN: usize = 8;
+#[repr(C)]
+struct SockaddrLl {
+    sll_family: u16,
+    sll_protocol: u16,
+    sll_ifindex: i32,
+    sll_hatype: u16,
+    sll_pkttype: u8,
+    sll_halen: u8,
+    sll_addr: [u8; 8],
+}
 
 const fn create_bpf_filter_udp(port: u16) -> [SockFilter; 4] {
     [
@@ -119,29 +133,6 @@ const fn create_bpf_filter_ipv4(port: u16) -> [SockFilter; 7] {
     ]
 }
 
-fn attach_bpf_filter(socket: &Socket, filter: &[SockFilter]) -> Result<()> {
-    let prog = SockFprog {
-        len: filter.len() as u16,
-        filter: filter.as_ptr(),
-    };
-
-    let ret = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            SO_ATTACH_FILTER,
-            &prog as *const _ as *const libc::c_void,
-            std::mem::size_of::<SockFprog>() as libc::socklen_t,
-        )
-    };
-
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-
-    Ok(())
-}
-
 struct Destination {
     addr: SocketAddr,
     sock_addr: SockAddr,
@@ -159,6 +150,8 @@ pub struct Worker {
     recv_socket: Socket,
     send_socket: Socket,
     raw_send_socket: Option<Socket>,
+    packet_socket_v6: Option<Socket>,
+    packet_ifindex: i32,
     destinations: Vec<Destination>,
     listen_port: u16,
     mode: IterationMode,
@@ -196,16 +189,29 @@ impl Worker {
 
         let send_socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
-        let raw_send_socket = if args.spoof {
+        let raw_send_socket = if args.spoof && !is_ipv6 {
             let sock = Socket::new(domain, Type::RAW, Some(Protocol::UDP))?;
-            if is_ipv6 {
-                sock.set_header_included_v6(true)?;
-            } else {
-                sock.set_header_included_v4(true)?;
-            }
+            sock.set_header_included_v4(true)?;
             Some(sock)
         } else {
             None
+        };
+
+        // For IPv6 spoofing, we need to use AF_PACKET socket
+        let (packet_socket_v6, packet_ifindex) = if args.spoof && is_ipv6 {
+            let sock = Socket::new(
+                Domain::PACKET,
+                Type::DGRAM,
+                Some(Protocol::from(ETH_P_IPV6 as i32)),
+            )?;
+            let ifindex = get_loopback_ifindex().unwrap_or(1);
+            log::info!(
+                "Created AF_PACKET socket for IPv6 spoofing (ifindex={})",
+                ifindex
+            );
+            (Some(sock), ifindex)
+        } else {
+            (None, 0)
         };
 
         let destinations: Vec<Destination> = args
@@ -231,6 +237,8 @@ impl Worker {
             recv_socket,
             send_socket,
             raw_send_socket,
+            packet_socket_v6,
+            packet_ifindex,
             destinations,
             listen_port,
             mode,
@@ -354,38 +362,93 @@ impl Worker {
 
     fn send_spoofed(&mut self, payload: &[u8], src: SocketAddr, dest_idx: usize) {
         let dest = &self.destinations[dest_idx];
-        let raw_socket = self.raw_send_socket.as_ref().unwrap();
 
-        let packet_len = match (src, dest.addr) {
-            (SocketAddr::V4(src_v4), SocketAddr::V4(dest_v4)) => build_packet_v4_into(
-                &mut self.send_buf,
-                payload,
-                *src_v4.ip(),
-                src_v4.port(),
-                *dest_v4.ip(),
-                dest_v4.port(),
-                self.ttl,
-            ),
-            (SocketAddr::V6(src_v6), SocketAddr::V6(dest_v6)) => build_packet_v6_into(
-                &mut self.send_buf,
-                payload,
-                *src_v6.ip(),
-                src_v6.port(),
-                *dest_v6.ip(),
-                dest_v6.port(),
-                self.ttl,
-            ),
+        match (src, dest.addr) {
+            (SocketAddr::V4(src_v4), SocketAddr::V4(dest_v4)) => {
+                let raw_socket = self.raw_send_socket.as_ref().unwrap();
+                let packet_len = build_packet_v4_into(
+                    &mut self.send_buf,
+                    payload,
+                    *src_v4.ip(),
+                    src_v4.port(),
+                    *dest_v4.ip(),
+                    dest_v4.port(),
+                    self.ttl,
+                );
+                if let Err(e) = raw_socket.send_to(&self.send_buf[..packet_len], &dest.sock_addr) {
+                    log::error!("Failed to send spoofed packet to {}: {}", dest.addr, e);
+                }
+            }
+            (SocketAddr::V6(src_v6), SocketAddr::V6(dest_v6)) => {
+                let sock = self.packet_socket_v6.as_ref().unwrap();
+                let packet_len = build_packet_v6_into(
+                    &mut self.send_buf,
+                    payload,
+                    *src_v6.ip(),
+                    src_v6.port(),
+                    *dest_v6.ip(),
+                    dest_v6.port(),
+                    self.ttl,
+                );
+
+                let sockaddr = SockaddrLl {
+                    sll_family: libc::AF_PACKET as u16,
+                    sll_protocol: (ETH_P_IPV6 as u16).to_be(),
+                    sll_ifindex: self.packet_ifindex,
+                    sll_hatype: 0,
+                    sll_pkttype: 0,
+                    sll_halen: 0,
+                    sll_addr: [0; 8],
+                };
+
+                let ret = unsafe {
+                    libc::sendto(
+                        sock.as_raw_fd(),
+                        self.send_buf.as_ptr() as *const libc::c_void,
+                        packet_len,
+                        0,
+                        &sockaddr as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<SockaddrLl>() as libc::socklen_t,
+                    )
+                };
+
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    log::error!(
+                        "Failed to send spoofed IPv6 packet to {}: {}",
+                        dest.addr,
+                        err
+                    );
+                }
+            }
             _ => {
                 log::error!("Address family mismatch: src={}, dest={}", src, dest.addr);
-                return;
             }
-        };
-
-        let dest = &self.destinations[dest_idx];
-        if let Err(e) = raw_socket.send_to(&self.send_buf[..packet_len], &dest.sock_addr) {
-            log::error!("Failed to send spoofed packet to {}: {}", dest.addr, e);
         }
     }
+}
+
+fn attach_bpf_filter(socket: &Socket, filter: &[SockFilter]) -> Result<()> {
+    let prog = SockFprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr(),
+    };
+
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_ATTACH_FILTER,
+            &prog as *const _ as *const libc::c_void,
+            std::mem::size_of::<SockFprog>() as libc::socklen_t,
+        )
+    };
+
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    Ok(())
 }
 
 fn build_packet_v4_into(
@@ -439,13 +502,15 @@ fn build_packet_v6_into(
     let total_len = IPV6_HEADER_LEN + udp_len;
 
     {
-        let mut ip = MutableIpv6Packet::new(&mut buf[..IPV6_HEADER_LEN]).unwrap();
-        ip.set_version(6);
-        ip.set_payload_length(udp_len as u16);
-        ip.set_next_header(IpNextHeaderProtocols::Udp);
-        ip.set_hop_limit(hop_limit);
-        ip.set_source(src_ip);
-        ip.set_destination(dest_ip);
+        let mut ip6 = MutableIpv6Packet::new(&mut buf[..IPV6_HEADER_LEN]).unwrap();
+        ip6.set_version(6);
+        ip6.set_traffic_class(0);
+        ip6.set_flow_label(0);
+        ip6.set_payload_length(udp_len as u16);
+        ip6.set_next_header(IpNextHeaderProtocols::Udp);
+        ip6.set_hop_limit(hop_limit);
+        ip6.set_source(src_ip);
+        ip6.set_destination(dest_ip);
     }
 
     buf[IPV6_HEADER_LEN + UDP_HEADER_LEN..total_len].copy_from_slice(payload);
@@ -461,4 +526,11 @@ fn build_packet_v6_into(
     }
 
     total_len
+}
+
+fn get_loopback_ifindex() -> Option<i32> {
+    unsafe {
+        let idx = libc::if_nametoindex(b"lo\0".as_ptr() as *const libc::c_char);
+        if idx == 0 { None } else { Some(idx as i32) }
+    }
 }

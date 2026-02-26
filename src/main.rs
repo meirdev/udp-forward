@@ -1,15 +1,12 @@
-mod cli;
-mod worker;
-
 use std::net::SocketAddr;
 use std::thread;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::Args;
 use nix::unistd::daemon;
 use socket2::{Domain, Protocol, Socket, Type};
-use worker::Worker;
+use udp_forward::cli::Args;
+use udp_forward::worker::Worker;
 
 fn is_port_in_use(addr: SocketAddr) -> bool {
     let domain = if addr.is_ipv6() {
