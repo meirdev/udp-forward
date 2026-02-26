@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use pnet_packet::Packet;
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::ipv4::{self, Ipv4Packet, MutableIpv4Packet};
-use pnet_packet::ipv6::{Ipv6Packet, MutableIpv6Packet};
+use pnet_packet::ipv6::MutableIpv6Packet;
 use pnet_packet::udp::{self, MutableUdpPacket, UdpPacket};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -33,45 +33,53 @@ const IPV6_HEADER_LEN: usize = 40;
 const UDP_HEADER_LEN: usize = 8;
 
 fn create_bpf_filter_v4(port: u16) -> Vec<SockFilter> {
+    // BPF filter for IPv4: check protocol is UDP, then check destination port
     vec![
+        // Load byte at offset 9 (IP protocol field)
         SockFilter {
-            code: 0x30,
+            code: 0x30, // ldb
             jt: 0,
             jf: 0,
             k: 9,
         },
+        // Jump if protocol == 17 (UDP)
         SockFilter {
-            code: 0x15,
+            code: 0x15, // jeq
             jt: 0,
             jf: 4,
             k: 17,
         },
+        // Load IP header length into X
         SockFilter {
-            code: 0xb1,
+            code: 0xb1, // ldxb 4*([k]&0xf)
             jt: 0,
             jf: 0,
             k: 0,
         },
+        // Load half-word at X+2 (UDP destination port)
         SockFilter {
-            code: 0x48,
+            code: 0x48, // ldh ind
             jt: 0,
             jf: 0,
             k: 2,
         },
+        // Jump if port matches
         SockFilter {
-            code: 0x15,
+            code: 0x15, // jeq
             jt: 0,
             jf: 1,
             k: port as u32,
         },
+        // Accept packet
         SockFilter {
-            code: 0x06,
+            code: 0x06, // ret
             jt: 0,
             jf: 0,
             k: 0xffff,
         },
+        // Reject packet
         SockFilter {
-            code: 0x06,
+            code: 0x06, // ret
             jt: 0,
             jf: 0,
             k: 0,
@@ -80,39 +88,33 @@ fn create_bpf_filter_v4(port: u16) -> Vec<SockFilter> {
 }
 
 fn create_bpf_filter_v6(port: u16) -> Vec<SockFilter> {
+    // IPv6 raw sockets don't include the IPv6 header, data starts with UDP header.
+    // UDP destination port is at offset 2.
     vec![
+        // Load half-word at offset 2 (UDP destination port)
         SockFilter {
-            code: 0x30,
+            code: 0x28, // ldh
             jt: 0,
             jf: 0,
-            k: 6,
+            k: 2,
         },
+        // Jump if port matches
         SockFilter {
-            code: 0x15,
-            jt: 0,
-            jf: 3,
-            k: 17,
-        },
-        SockFilter {
-            code: 0x28,
-            jt: 0,
-            jf: 0,
-            k: 42,
-        },
-        SockFilter {
-            code: 0x15,
+            code: 0x15, // jeq
             jt: 0,
             jf: 1,
             k: port as u32,
         },
+        // Accept packet
         SockFilter {
-            code: 0x06,
+            code: 0x06, // ret
             jt: 0,
             jf: 0,
             k: 0xffff,
         },
+        // Reject packet
         SockFilter {
-            code: 0x06,
+            code: 0x06, // ret
             jt: 0,
             jf: 0,
             k: 0,
@@ -158,6 +160,7 @@ enum IterationMode {
 
 pub struct Worker {
     recv_socket: Socket,
+    send_socket: Socket,
     raw_send_socket: Option<Socket>,
     destinations: Vec<Destination>,
     listen_port: u16,
@@ -195,6 +198,9 @@ impl Worker {
             sock
         };
 
+        // Normal UDP socket for sending (needed in silent mode since recv_socket is raw)
+        let send_socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+
         let raw_send_socket = if args.spoof {
             let sock = Socket::new(domain, Type::RAW, Some(Protocol::UDP))?;
             if is_ipv6 {
@@ -228,6 +234,7 @@ impl Worker {
 
         Ok(Self {
             recv_socket,
+            send_socket,
             raw_send_socket,
             destinations,
             listen_port,
@@ -253,17 +260,21 @@ impl Worker {
             let payload =
                 unsafe { std::slice::from_raw_parts(self.recv_buf.as_ptr() as *const u8, len) };
             let src: SocketAddr = src_addr.as_socket().context("Invalid source address")?;
+            log::debug!("Received {} bytes from {}", len, src);
             self.forward(payload, src);
         }
     }
 
     fn run_silent_v4_loop(&mut self) -> Result<()> {
+        // Raw socket returns full IP packet (IP header + UDP header + payload)
         loop {
             let (len, _) = self.recv_socket.recv_from(&mut self.recv_buf)?;
+            log::debug!("Silent v4: recv_from returned {} bytes", len);
             let data =
                 unsafe { std::slice::from_raw_parts(self.recv_buf.as_ptr() as *const u8, len) };
 
             let Some(ip_packet) = Ipv4Packet::new(data) else {
+                log::debug!("Silent v4: failed to parse IP packet ({} bytes)", len);
                 continue;
             };
 
@@ -271,6 +282,7 @@ impl Worker {
             let ip_header_len = (ip_packet.get_header_length() as usize) * 4;
 
             let Some(udp_packet) = UdpPacket::new(&data[ip_header_len..]) else {
+                log::debug!("Silent v4: failed to parse UDP packet from {}", src_ip);
                 continue;
             };
 
@@ -279,23 +291,35 @@ impl Worker {
             }
 
             let src = SocketAddr::V4(SocketAddrV4::new(src_ip, udp_packet.get_source()));
+            log::debug!(
+                "Received {} bytes from {} (silent v4)",
+                udp_packet.payload().len(),
+                src
+            );
             self.forward(udp_packet.payload(), src);
         }
     }
 
     fn run_silent_v6_loop(&mut self) -> Result<()> {
+        // Note: IPv6 raw sockets do NOT include the IPv6 header in received data.
+        // We get source IP from recv_from's returned address.
         loop {
-            let (len, _) = self.recv_socket.recv_from(&mut self.recv_buf)?;
+            let (len, src_addr) = self.recv_socket.recv_from(&mut self.recv_buf)?;
+            log::debug!("Silent v6: recv_from returned {} bytes", len);
             let data =
                 unsafe { std::slice::from_raw_parts(self.recv_buf.as_ptr() as *const u8, len) };
 
-            let Some(ip_packet) = Ipv6Packet::new(data) else {
-                continue;
+            let src_ip = match src_addr.as_socket_ipv6() {
+                Some(addr) => *addr.ip(),
+                None => {
+                    log::debug!("Silent v6: received non-IPv6 source address");
+                    continue;
+                }
             };
 
-            let src_ip = ip_packet.get_source();
-
-            let Some(udp_packet) = UdpPacket::new(&data[IPV6_HEADER_LEN..]) else {
+            // IPv6 raw sockets return UDP header + payload (no IPv6 header)
+            let Some(udp_packet) = UdpPacket::new(data) else {
+                log::debug!("Silent v6: failed to parse UDP packet ({} bytes)", len);
                 continue;
             };
 
@@ -304,6 +328,11 @@ impl Worker {
             }
 
             let src = SocketAddr::V6(SocketAddrV6::new(src_ip, udp_packet.get_source(), 0, 0));
+            log::debug!(
+                "Received {} bytes from {} (silent v6)",
+                udp_packet.payload().len(),
+                src
+            );
             self.forward(udp_packet.payload(), src);
         }
     }
@@ -320,7 +349,8 @@ impl Worker {
 
     fn send_normal(&self, payload: &[u8], dest_idx: usize) {
         let dest = &self.destinations[dest_idx];
-        if let Err(e) = self.recv_socket.send_to(payload, &dest.sock_addr) {
+        log::debug!("Forwarding {} bytes to {} (normal)", payload.len(), dest.addr);
+        if let Err(e) = self.send_socket.send_to(payload, &dest.sock_addr) {
             log::error!("Failed to send to {}: {}", dest.addr, e);
         }
     }
