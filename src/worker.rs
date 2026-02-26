@@ -32,54 +32,32 @@ const IP_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const UDP_HEADER_LEN: usize = 8;
 
-fn create_bpf_filter_v4(port: u16) -> Vec<SockFilter> {
-    // BPF filter for IPv4: check protocol is UDP, then check destination port
-    vec![
-        // Load byte at offset 9 (IP protocol field)
+const fn create_bpf_filter_udp(port: u16) -> [SockFilter; 4] {
+    [
+        // Load half-word at offset 2 (UDP destination port)
         SockFilter {
-            code: 0x30, // ldb
-            jt: 0,
-            jf: 0,
-            k: 9,
-        },
-        // Jump if protocol == 17 (UDP)
-        SockFilter {
-            code: 0x15, // jeq
-            jt: 0,
-            jf: 4,
-            k: 17,
-        },
-        // Load IP header length into X
-        SockFilter {
-            code: 0xb1, // ldxb 4*([k]&0xf)
-            jt: 0,
-            jf: 0,
-            k: 0,
-        },
-        // Load half-word at X+2 (UDP destination port)
-        SockFilter {
-            code: 0x48, // ldh ind
+            code: 0x28,
             jt: 0,
             jf: 0,
             k: 2,
         },
         // Jump if port matches
         SockFilter {
-            code: 0x15, // jeq
+            code: 0x15,
             jt: 0,
             jf: 1,
             k: port as u32,
         },
         // Accept packet
         SockFilter {
-            code: 0x06, // ret
+            code: 0x06,
             jt: 0,
             jf: 0,
             k: 0xffff,
         },
         // Reject packet
         SockFilter {
-            code: 0x06, // ret
+            code: 0x06,
             jt: 0,
             jf: 0,
             k: 0,
@@ -87,34 +65,53 @@ fn create_bpf_filter_v4(port: u16) -> Vec<SockFilter> {
     ]
 }
 
-fn create_bpf_filter_v6(port: u16) -> Vec<SockFilter> {
-    // IPv6 raw sockets don't include the IPv6 header, data starts with UDP header.
-    // UDP destination port is at offset 2.
-    vec![
-        // Load half-word at offset 2 (UDP destination port)
+const fn create_bpf_filter_ipv4(port: u16) -> [SockFilter; 7] {
+    [
+        // Load byte at offset 9 (IP protocol field)
         SockFilter {
-            code: 0x28, // ldh
+            code: 0x30,
+            jt: 0,
+            jf: 0,
+            k: 9,
+        },
+        // Jump if protocol == 17 (UDP), else reject
+        SockFilter {
+            code: 0x15,
+            jt: 0,
+            jf: 4,
+            k: 17,
+        },
+        // Load IP header length into X
+        SockFilter {
+            code: 0xb1,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        // Load half-word at X+2 (UDP destination port)
+        SockFilter {
+            code: 0x48,
             jt: 0,
             jf: 0,
             k: 2,
         },
         // Jump if port matches
         SockFilter {
-            code: 0x15, // jeq
+            code: 0x15,
             jt: 0,
             jf: 1,
             k: port as u32,
         },
         // Accept packet
         SockFilter {
-            code: 0x06, // ret
+            code: 0x06,
             jt: 0,
             jf: 0,
             k: 0xffff,
         },
         // Reject packet
         SockFilter {
-            code: 0x06, // ret
+            code: 0x06,
             jt: 0,
             jf: 0,
             k: 0,
@@ -179,12 +176,11 @@ impl Worker {
 
         let recv_socket = if args.silent {
             let sock = Socket::new(domain, Type::RAW, Some(Protocol::UDP))?;
-            let filter = if is_ipv6 {
-                create_bpf_filter_v6(listen_port)
+            if is_ipv6 {
+                attach_bpf_filter(&sock, &create_bpf_filter_udp(listen_port))?;
             } else {
-                create_bpf_filter_v4(listen_port)
-            };
-            attach_bpf_filter(&sock, &filter).context("Failed to attach BPF filter")?;
+                attach_bpf_filter(&sock, &create_bpf_filter_ipv4(listen_port))?;
+            }
             log::info!(
                 "BPF filter attached for UDP port {} ({})",
                 listen_port,
@@ -300,6 +296,7 @@ impl Worker {
     }
 
     fn run_silent_v6_loop(&mut self) -> Result<()> {
+        // Raw socket returns UDP packet without IPv6 header
         loop {
             let (len, src_addr) = self.recv_socket.recv_from(&mut self.recv_buf)?;
             log::debug!("Silent v6: recv_from returned {} bytes", len);
