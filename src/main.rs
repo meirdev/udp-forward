@@ -1,13 +1,26 @@
-mod cli;
-mod worker;
-
+use std::net::SocketAddr;
 use std::thread;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::Args;
 use nix::unistd::daemon;
-use worker::Worker;
+use socket2::{Domain, Protocol, Socket, Type};
+use udp_forward::cli::Args;
+use udp_forward::worker::Worker;
+
+fn is_port_in_use(addr: SocketAddr) -> bool {
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+
+    let Ok(sock) = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)) else {
+        return false;
+    };
+
+    sock.bind(&addr.into()).is_err()
+}
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -50,6 +63,10 @@ fn main() -> Result<()> {
         args.workers
     };
 
+    if !args.silent && is_port_in_use(args.listen) {
+        anyhow::bail!("Port {} is already in use", args.listen);
+    }
+
     log::info!("Config: {:?}", args);
     log::info!("Starting {} worker thread(s)", workers);
 
@@ -60,7 +77,13 @@ fn main() -> Result<()> {
         let handle = thread::Builder::new()
             .name(format!("worker-{}", i))
             .spawn(move || {
-                let worker = Worker::new(&args).expect("Failed to create worker");
+                let worker = match Worker::new(&args) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        log::error!("Failed to create worker {}: {}", i, e);
+                        return;
+                    }
+                };
                 if let Err(e) = worker.run() {
                     log::error!("Worker {} error: {}", i, e);
                 }
