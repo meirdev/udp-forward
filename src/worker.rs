@@ -198,7 +198,6 @@ impl Worker {
             sock
         };
 
-        // Normal UDP socket for sending (needed in silent mode since recv_socket is raw)
         let send_socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
         let raw_send_socket = if args.spoof {
@@ -301,8 +300,6 @@ impl Worker {
     }
 
     fn run_silent_v6_loop(&mut self) -> Result<()> {
-        // Note: IPv6 raw sockets do NOT include the IPv6 header in received data.
-        // We get source IP from recv_from's returned address.
         loop {
             let (len, src_addr) = self.recv_socket.recv_from(&mut self.recv_buf)?;
             log::debug!("Silent v6: recv_from returned {} bytes", len);
@@ -317,7 +314,6 @@ impl Worker {
                 }
             };
 
-            // IPv6 raw sockets return UDP header + payload (no IPv6 header)
             let Some(udp_packet) = UdpPacket::new(data) else {
                 log::debug!("Silent v6: failed to parse UDP packet ({} bytes)", len);
                 continue;
@@ -349,7 +345,11 @@ impl Worker {
 
     fn send_normal(&self, payload: &[u8], dest_idx: usize) {
         let dest = &self.destinations[dest_idx];
-        log::debug!("Forwarding {} bytes to {} (normal)", payload.len(), dest.addr);
+        log::debug!(
+            "Forwarding {} bytes to {} (normal)",
+            payload.len(),
+            dest.addr
+        );
         if let Err(e) = self.send_socket.send_to(payload, &dest.sock_addr) {
             log::error!("Failed to send to {}: {}", dest.addr, e);
         }
