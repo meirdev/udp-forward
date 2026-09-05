@@ -9,7 +9,7 @@ clap = { version = "4.5.60", features = ["derive"] }
 env_logger = "0.11.9"
 libc = "0.2.180"
 log = "0.4.29"
-nix = { version = "0.31.1", features = ["process"] }
+nix = { version = "0.31.1", features = ["process", "net", "uio"] }
 num_cpus = "1.17.0"
 pnet_packet = "0.35.0"
 socket2 = { version = "0.6.2", features = ["all"] }
