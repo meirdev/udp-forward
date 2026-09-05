@@ -8,7 +8,8 @@ use std::os::fd::AsRawFd;
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 
-use super::{Destination, PacketSink, to_destinations};
+use super::PacketSink;
+use super::batch::BatchedSender;
 
 /// Forwards with the original sender's address preserved, via a per-source
 /// transparent socket bound to that address (IP_TRANSPARENT /
@@ -17,7 +18,7 @@ pub(crate) struct SpoofSink {
     // Keyed by original source address; each socket is bound to that address so
     // the kernel emits packets with it as the source.
     cache: HashMap<SocketAddr, Socket>,
-    destinations: Vec<Destination>,
+    sender: BatchedSender,
     ttl: u8,
 }
 
@@ -25,7 +26,7 @@ impl SpoofSink {
     pub(crate) fn new(destinations: &[SocketAddr], ttl: u8) -> Self {
         Self {
             cache: HashMap::new(),
-            destinations: to_destinations(destinations),
+            sender: BatchedSender::new(destinations),
             ttl,
         }
     }
@@ -44,17 +45,22 @@ impl PacketSink for SpoofSink {
             self.cache.insert(src, sock);
         }
 
-        let sock = &self.cache[&src];
-        for dest in &self.destinations {
-            log::debug!(
-                "Forwarding {} bytes to {} (spoofed source {})",
+        // All destinations for this source go out its socket, so one sendmmsg
+        // fans the payload out to every one of them.
+        let fd = self.cache[&src].as_raw_fd();
+        log::debug!(
+            "Forwarding {} bytes to {} destination(s) (spoofed source {})",
+            payload.len(),
+            self.sender.destination_count(),
+            src
+        );
+        if let Err(e) = self.sender.send_to_all(fd, payload) {
+            log::error!(
+                "Failed to forward spoofed {} bytes from {}: {}",
                 payload.len(),
-                dest.addr,
-                src
+                src,
+                e
             );
-            if let Err(e) = sock.send_to(payload, &dest.sock_addr) {
-                log::error!("Failed to send spoofed packet to {}: {}", dest.addr, e);
-            }
         }
     }
 }

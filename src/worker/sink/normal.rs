@@ -2,16 +2,18 @@
 //! socket.
 
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 
 use anyhow::Result;
 use socket2::{Domain, Protocol, Socket, Type};
 
-use super::{Destination, PacketSink, to_destinations};
+use super::PacketSink;
+use super::batch::BatchedSender;
 
 /// Forwards from the forwarder's own address via a single shared socket.
 pub(crate) struct NormalSink {
     socket: Socket,
-    destinations: Vec<Destination>,
+    sender: BatchedSender,
 }
 
 impl NormalSink {
@@ -25,22 +27,21 @@ impl NormalSink {
         }
         Ok(Self {
             socket,
-            destinations: to_destinations(destinations),
+            sender: BatchedSender::new(destinations),
         })
     }
 }
 
 impl PacketSink for NormalSink {
     fn send(&mut self, payload: &[u8], _src: SocketAddr) {
-        for dest in &self.destinations {
-            log::debug!(
-                "Forwarding {} bytes to {} (normal)",
-                payload.len(),
-                dest.addr
-            );
-            if let Err(e) = self.socket.send_to(payload, &dest.sock_addr) {
-                log::error!("Failed to send to {}: {}", dest.addr, e);
-            }
+        let fd = self.socket.as_raw_fd();
+        log::debug!(
+            "Forwarding {} bytes to {} destination(s) (normal)",
+            payload.len(),
+            self.sender.destination_count()
+        );
+        if let Err(e) = self.sender.send_to_all(fd, payload) {
+            log::error!("Failed to forward {} bytes: {}", payload.len(), e);
         }
     }
 }
