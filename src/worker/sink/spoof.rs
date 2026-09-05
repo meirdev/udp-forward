@@ -2,6 +2,7 @@
 //! transparent sockets (IP_TRANSPARENT / IPV6_TRANSPARENT).
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 
@@ -25,20 +26,8 @@ pub(crate) struct SpoofSink {
 
 impl SpoofSink {
     pub(crate) fn new(destinations: &[SocketAddr], ttl: u8, is_ipv6: bool) -> Result<Self> {
-        // Verify at startup that we can set the transparent option (needs
-        // CAP_NET_ADMIN), so a privilege problem fails fast instead of on every
-        // packet's failed socket creation.
-        let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
-        let probe =
-            Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create spoof probe")?;
-        if is_ipv6 {
-            set_ipv6_transparent(&probe).context("set IPV6_TRANSPARENT (needs CAP_NET_ADMIN)")?;
-        } else {
-            probe
-                .set_ip_transparent_v4(true)
-                .context("set IP_TRANSPARENT (needs CAP_NET_ADMIN)")?;
-        }
-        drop(probe);
+        // Validate all outgoing socket options before accepting traffic.
+        drop(new_spoof_socket(is_ipv6, ttl)?);
 
         Ok(Self {
             cache: HashMap::new(),
@@ -50,18 +39,16 @@ impl SpoofSink {
     /// Returns the raw fd of the transparent socket bound to `src`, creating
     /// and caching it on first use. `None` if the socket cannot be created.
     fn socket_for(&mut self, src: SocketAddr) -> Option<RawFd> {
-        if !self.cache.contains_key(&src) {
-            match make_spoof_socket(src, self.ttl) {
-                Ok(sock) => {
-                    self.cache.insert(src, sock);
-                }
+        match self.cache.entry(src) {
+            Entry::Occupied(entry) => Some(entry.get().as_raw_fd()),
+            Entry::Vacant(entry) => match make_spoof_socket(src, self.ttl) {
+                Ok(socket) => Some(entry.insert(socket).as_raw_fd()),
                 Err(e) => {
-                    log::error!("Failed to create spoof socket for source {}: {}", src, e);
-                    return None;
+                    log::error!("Failed to create spoof socket for source {}: {:#}", src, e);
+                    None
                 }
-            }
+            },
         }
-        Some(self.cache[&src].as_raw_fd())
     }
 }
 
@@ -101,11 +88,15 @@ impl PacketSink for SpoofSink {
 /// across real interfaces, and can use transmit offloads. Requires
 /// CAP_NET_ADMIN (root).
 fn make_spoof_socket(src: SocketAddr, ttl: u8) -> Result<Socket> {
-    let domain = if src.is_ipv6() {
-        Domain::IPV6
-    } else {
-        Domain::IPV4
-    };
+    let sock = new_spoof_socket(src.is_ipv6(), ttl)?;
+    sock.bind(&src.into())
+        .with_context(|| format!("bind spoof source {}", src))?;
+    Ok(sock)
+}
+
+/// Configures a transparent socket; binding the original source is separate.
+fn new_spoof_socket(is_ipv6: bool, ttl: u8) -> Result<Socket> {
+    let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
 
     let sock =
         Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create spoof socket")?;
@@ -115,7 +106,7 @@ fn make_spoof_socket(src: SocketAddr, ttl: u8) -> Result<Socket> {
     sock.set_reuse_address(true).context("set SO_REUSEADDR")?;
     sock.set_reuse_port(true).context("set SO_REUSEPORT")?;
 
-    if src.is_ipv6() {
+    if is_ipv6 {
         set_ipv6_transparent(&sock).context("set IPV6_TRANSPARENT")?;
         sock.set_freebind_v6(true).context("set IPV6_FREEBIND")?;
         sock.set_unicast_hops_v6(ttl as u32)
@@ -126,9 +117,6 @@ fn make_spoof_socket(src: SocketAddr, ttl: u8) -> Result<Socket> {
         sock.set_freebind_v4(true).context("set IP_FREEBIND")?;
         sock.set_ttl_v4(ttl as u32).context("set IPv4 TTL")?;
     }
-
-    sock.bind(&src.into())
-        .with_context(|| format!("bind spoof source {}", src))?;
 
     Ok(sock)
 }

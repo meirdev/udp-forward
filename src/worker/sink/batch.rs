@@ -33,7 +33,10 @@ pub(super) struct BatchedSender {
 
 impl BatchedSender {
     pub(super) fn new(destinations: &[SocketAddr]) -> Self {
-        let chunk = MAX_MSGS_PER_CALL.min(RECV_BATCH_SIZE * destinations.len().max(1));
+        let chunk = destinations
+            .len()
+            .saturating_mul(RECV_BATCH_SIZE)
+            .min(MAX_MSGS_PER_CALL);
         Self {
             dests: destinations
                 .iter()
@@ -57,10 +60,16 @@ impl BatchedSender {
         if payloads.is_empty() || ndests == 0 {
             return Ok(SendReport::default());
         }
-        let total = payloads.len() * ndests;
+        let total = payloads
+            .len()
+            .checked_mul(ndests)
+            .context("outgoing message count overflow")?;
 
         run_send_loop(total, |next, end| {
             self.build_chunk(payloads, next, end);
+            // SAFETY: every header references a live destination, payload, and
+            // iovec. None of those allocations move during this synchronous
+            // call, and the kernel only writes to the message headers.
             let ret = unsafe {
                 libc::sendmmsg(fd, self.msgs.as_mut_ptr(), (end - next) as libc::c_uint, 0)
             };
@@ -90,9 +99,12 @@ impl BatchedSender {
         self.msgs.clear();
         for (k, m) in (next..end).enumerate() {
             let dest = &self.dests[m % ndests];
+            // SAFETY: zero is valid for all msghdr fields; unused ancillary
+            // data fields remain null/zero.
             let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
             hdr.msg_name = dest.as_ptr() as *mut libc::c_void;
             hdr.msg_namelen = dest.len();
+            // SAFETY: one iovec was populated for each message above.
             hdr.msg_iov = unsafe { iov_base.add(k) };
             hdr.msg_iovlen = 1;
             self.msgs.push(libc::mmsghdr {
@@ -121,7 +133,7 @@ where
     let mut next = 0;
 
     while next < total {
-        let end = (next + MAX_MSGS_PER_CALL).min(total);
+        let end = next + (total - next).min(MAX_MSGS_PER_CALL);
         match send_chunk(next, end) {
             Ok(sent) => {
                 report.sent += sent;
@@ -185,7 +197,7 @@ mod tests {
 
     #[test]
     fn exact_chunk_boundaries() {
-        for total in [1, 1023, 1024, 1025, 2048] {
+        for total in [0, 1, 1023, 1024, 1025, 2048] {
             let report = run_send_loop(total, |next, end| Ok(end - next)).unwrap();
             assert_eq!(
                 report,
@@ -197,6 +209,46 @@ mod tests {
                 total
             );
         }
+    }
+
+    #[test]
+    fn partial_completion_across_chunks_preserves_every_message() {
+        let mut calls = Vec::new();
+        let mut accepted = [600, 424, 1].into_iter();
+        let report = run_send_loop(1025, |next, end| {
+            calls.push((next, end));
+            Ok(accepted.next().expect("unexpected extra send"))
+        })
+        .unwrap();
+
+        assert_eq!(calls, [(0, 1024), (600, 1025), (1024, 1025)]);
+        assert_eq!(
+            report,
+            SendReport {
+                sent: 1025,
+                dropped: 0
+            }
+        );
+    }
+
+    #[test]
+    fn interruption_after_partial_completion_retries_the_same_messages() {
+        let mut calls = Vec::new();
+        let mut results = [Ok(2), Err(err(libc::EINTR)), Ok(3)].into_iter();
+        let report = run_send_loop(5, |next, end| {
+            calls.push((next, end));
+            results.next().expect("unexpected extra send")
+        })
+        .unwrap();
+
+        assert_eq!(calls, [(0, 5), (2, 5), (2, 5)]);
+        assert_eq!(
+            report,
+            SendReport {
+                sent: 5,
+                dropped: 0
+            }
+        );
     }
 
     #[test]

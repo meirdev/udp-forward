@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use super::PacketSource;
@@ -25,7 +25,9 @@ impl NormalSource {
         };
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_reuse_port(true)?;
-        socket.bind(&listen.into())?;
+        socket
+            .bind(&listen.into())
+            .with_context(|| format!("Failed to bind listen address {listen}"))?;
         Ok(Self {
             socket,
             rx: BatchedReceiver::new(buffer_size),

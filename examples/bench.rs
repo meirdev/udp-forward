@@ -155,7 +155,7 @@ fn recv(bind: SocketAddr, secs: u64) {
                 fd,
                 msgs.as_mut_ptr(),
                 BATCH as libc::c_uint,
-                libc::MSG_WAITFORONE as libc::c_int,
+                libc::MSG_WAITFORONE as _,
                 std::ptr::null_mut(),
             )
         };
