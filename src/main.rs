@@ -8,26 +8,56 @@ use socket2::{Domain, Protocol, Socket, Type};
 use udp_forward::cli::Args;
 use udp_forward::worker::Worker;
 
-fn is_port_in_use(addr: SocketAddr) -> bool {
+fn init_logger(logfile: Option<&std::path::Path>) -> Result<()> {
+    let mut builder = env_logger::Builder::from_default_env();
+
+    if let Some(path) = logfile {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("Failed to open log file {}", path.display()))?;
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+    }
+
+    builder.init();
+    Ok(())
+}
+
+/// Verifies the listen port can be bound before spawning workers, so a
+/// conflict fails fast with a clear error. The probe mirrors the workers'
+/// SO_REUSEPORT so it does not false-positive against a cooperating
+/// udp-forward instance, while still detecting a foreign holder of the port.
+fn check_listen_port(addr: SocketAddr) -> Result<()> {
     let domain = if addr.is_ipv6() {
         Domain::IPV6
     } else {
         Domain::IPV4
     };
 
-    let Ok(sock) = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)) else {
-        return false;
-    };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .context("Failed to create probe socket for port check")?;
+    sock.set_reuse_port(true)
+        .context("Failed to set SO_REUSEPORT on probe socket")?;
 
-    sock.bind(&addr.into()).is_err()
+    match sock.bind(&addr.into()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            anyhow::bail!("Port {} is already in use", addr)
+        }
+        Err(e) => Err(e).with_context(|| format!("Failed to bind {}", addr)),
+    }
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
-
     let args = Args::parse();
 
+    init_logger(args.logfile.as_deref())?;
+
     if args.fork {
+        if args.logfile.is_none() {
+            log::warn!("--fork without --logfile: log output will be discarded");
+        }
         daemon(false, false).context("Failed to daemonize")?;
     }
 
@@ -54,8 +84,9 @@ fn main() -> Result<()> {
 
     let workers = if args.silent && args.workers > 1 {
         log::warn!(
-            "Silent mode uses raw sockets which don't support multi-threading. \
-             Forcing single worker thread (requested: {})",
+            "Silent mode uses a single AF_PACKET capture socket; multiple \
+             workers would each receive a copy of every packet. Forcing single \
+             worker thread (requested: {})",
             args.workers
         );
         1
@@ -63,8 +94,8 @@ fn main() -> Result<()> {
         args.workers
     };
 
-    if !args.silent && is_port_in_use(args.listen) {
-        anyhow::bail!("Port {} is already in use", args.listen);
+    if !args.silent {
+        check_listen_port(args.listen)?;
     }
 
     log::info!("Config: {:?}", args);

@@ -21,6 +21,11 @@ pub struct Args {
     #[arg(short = 'S', long)]
     pub silent: bool,
 
+    /// Restrict silent-mode capture to a single interface (default: all
+    /// interfaces). Only meaningful with --silent.
+    #[arg(short = 'i', long)]
+    pub interface: Option<String>,
+
     /// TTL for outgoing packets
     #[arg(short = 'T', long, default_value_t = 64)]
     pub ttl: u8,
@@ -40,6 +45,11 @@ pub struct Args {
     /// Write PID to file (useful with --fork)
     #[arg(short, long)]
     pub pidfile: Option<PathBuf>,
+
+    /// Write logs to a file (recommended with --fork, which otherwise
+    /// discards log output)
+    #[arg(long)]
+    pub logfile: Option<PathBuf>,
 
     /// Destination addresses to forward packets to
     #[arg(required = true)]

@@ -1,6 +1,26 @@
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::process::{Child, Command};
 use std::time::Duration;
+
+use socket2::{Domain, Protocol, Socket, Type};
+
+/// Binds a sender socket with SO_REUSEPORT so it can coexist with the
+/// forwarder's IP_TRANSPARENT spoof socket, which binds the same source
+/// address to preserve it. Real senders are remote, so no such collision
+/// occurs; this only matters for the loopback simulation used in these tests.
+fn reuseport_sender(bind: &str) -> UdpSocket {
+    let addr: SocketAddr = bind.parse().expect("valid bind address");
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+    sock.set_reuse_address(true).unwrap();
+    sock.set_reuse_port(true).unwrap();
+    sock.bind(&addr.into()).unwrap();
+    sock.into()
+}
 
 fn spawn_forwarder(args: &[&str]) -> Child {
     Command::new(env!("CARGO_BIN_EXE_udp-forward"))
@@ -133,7 +153,7 @@ fn test_spoofed_source_ipv4() {
     let mut child = spawn_forwarder(&["-l", "127.0.0.1:4006", "-s", "127.0.0.1:5007"]);
     std::thread::sleep(Duration::from_millis(100));
 
-    let sender = UdpSocket::bind("127.0.0.1:12345").unwrap();
+    let sender = reuseport_sender("127.0.0.1:12345");
     sender.send_to(b"test_spoof_v4", "127.0.0.1:4006").unwrap();
 
     receiver
@@ -244,7 +264,7 @@ fn test_spoofed_source_ipv6() {
     let mut child = spawn_forwarder(&["-l", "[::1]:4106", "-s", "[::1]:5107"]);
     std::thread::sleep(Duration::from_millis(100));
 
-    let sender = UdpSocket::bind("[::1]:12346").unwrap();
+    let sender = reuseport_sender("[::1]:12346");
     sender.send_to(b"test_spoof_v6", "[::1]:4106").unwrap();
 
     receiver
@@ -272,7 +292,7 @@ fn test_silent_and_spoof_ipv4() {
     let mut child = spawn_forwarder(&["-l", "127.0.0.1:4007", "-S", "-s", "127.0.0.1:5008"]);
     std::thread::sleep(Duration::from_millis(200));
 
-    let sender = UdpSocket::bind("127.0.0.1:23456").unwrap();
+    let sender = reuseport_sender("127.0.0.1:23456");
     sender
         .send_to(b"test_silent_spoof_v4", "127.0.0.1:4007")
         .unwrap();
@@ -305,7 +325,7 @@ fn test_silent_and_spoof_ipv6() {
     let mut child = spawn_forwarder(&["-l", "[::1]:4107", "-S", "-s", "[::1]:5108"]);
     std::thread::sleep(Duration::from_millis(200));
 
-    let sender = UdpSocket::bind("[::1]:23457").unwrap();
+    let sender = reuseport_sender("[::1]:23457");
     sender
         .send_to(b"test_silent_spoof_v6", "[::1]:4107")
         .unwrap();
