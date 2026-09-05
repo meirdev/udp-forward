@@ -1,70 +1,272 @@
-//! Batched send shared by the sinks. One `sendmmsg` delivers many payloads,
-//! each to every destination, on a given socket.
+//! Batched send shared by the sinks: fans a batch of payloads out to every
+//! destination on a given socket with `sendmmsg`, in chunks of at most
+//! `MAX_MSGS_PER_CALL` messages.
+//!
+//! `libc::sendmmsg` is called directly rather than through nix: nix's result
+//! iterator reads a per-message address the send path never initializes, and
+//! the raw call returns how many messages were actually accepted, which the
+//! retry policy needs.
 
-use std::io::IoSlice;
+use std::io;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
 
 use anyhow::{Context, Result};
-use nix::sys::socket::{ControlMessage, MsgFlags, MultiHeaders, SockaddrStorage, sendmmsg};
+use nix::sys::socket::{SockaddrLike, SockaddrStorage};
 
-use crate::worker::packet::BATCH_SIZE;
+use crate::worker::packet::{RECV_BATCH_SIZE, SendReport};
 
-/// Holds the destination addresses and the scratch headers to fan a batch of
-/// payloads out to all destinations in one `sendmmsg`. Reused across sends, and
+// Linux caps a single sendmmsg at UIO_MAXIOV (1024) messages.
+const MAX_MSGS_PER_CALL: usize = 1024;
+
+/// Fans payloads out to a fixed destination set. Reused across sends, and
 /// across per-source sockets in the spoof sink (the destination set is the same
 /// for every source).
 pub(super) struct BatchedSender {
-    headers: MultiHeaders<SockaddrStorage>,
-    dest_addrs: Vec<Option<SockaddrStorage>>,
+    dests: Vec<SockaddrStorage>,
+    // Scratch descriptors for one chunk. They hold raw pointers with no Rust
+    // lifetimes, so the allocations persist across calls and are refilled per
+    // chunk, bounding memory to one chunk rather than the whole fan-out.
+    iovecs: Vec<libc::iovec>,
+    msgs: Vec<libc::mmsghdr>,
 }
 
 impl BatchedSender {
     pub(super) fn new(destinations: &[SocketAddr]) -> Self {
-        let dest_addrs = destinations
-            .iter()
-            .map(|&addr| Some(SockaddrStorage::from(addr)))
-            .collect::<Vec<_>>();
-        // A whole receive batch fanned out to every destination.
-        let capacity = BATCH_SIZE * destinations.len().max(1);
+        let chunk = MAX_MSGS_PER_CALL.min(RECV_BATCH_SIZE * destinations.len().max(1));
         Self {
-            headers: MultiHeaders::preallocate(capacity, None),
-            dest_addrs,
+            dests: destinations
+                .iter()
+                .map(|&addr| SockaddrStorage::from(addr))
+                .collect(),
+            iovecs: Vec::with_capacity(chunk),
+            msgs: Vec::with_capacity(chunk),
         }
     }
 
     pub(super) fn destination_count(&self) -> usize {
-        self.dest_addrs.len()
+        self.dests.len()
     }
 
-    /// Sends every payload to every destination via `fd` in a single
-    /// `sendmmsg` (`payloads.len() * destinations` messages).
-    pub(super) fn send(&mut self, fd: RawFd, payloads: &[&[u8]]) -> Result<()> {
-        if payloads.is_empty() || self.dest_addrs.is_empty() {
-            return Ok(());
+    /// Sends every payload to every destination via `fd`. Message `m` carries
+    /// payload `m / destinations` to destination `m % destinations`.
+    /// Per-message failures are counted in the report; `Err` means a fatal
+    /// socket error.
+    pub(super) fn send(&mut self, fd: RawFd, payloads: &[&[u8]]) -> Result<SendReport> {
+        let ndests = self.dests.len();
+        if payloads.is_empty() || ndests == 0 {
+            return Ok(SendReport::default());
         }
+        let total = payloads.len() * ndests;
 
-        let count = payloads.len() * self.dest_addrs.len();
-        let mut iovs: Vec<[IoSlice<'_>; 1]> = Vec::with_capacity(count);
-        let mut addrs: Vec<Option<SockaddrStorage>> = Vec::with_capacity(count);
-        for payload in payloads {
-            for addr in &self.dest_addrs {
-                iovs.push([IoSlice::new(payload)]);
-                addrs.push(*addr);
+        run_send_loop(total, |next, end| {
+            self.build_chunk(payloads, next, end);
+            let ret = unsafe {
+                libc::sendmmsg(fd, self.msgs.as_mut_ptr(), (end - next) as libc::c_uint, 0)
+            };
+            if ret < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(ret as usize)
             }
+        })
+    }
+
+    /// Fills the scratch descriptors for messages `[next, end)`.
+    fn build_chunk(&mut self, payloads: &[&[u8]], next: usize, end: usize) {
+        let ndests = self.dests.len();
+
+        self.iovecs.clear();
+        for m in next..end {
+            let payload = payloads[m / ndests];
+            self.iovecs.push(libc::iovec {
+                iov_base: payload.as_ptr() as *mut libc::c_void,
+                iov_len: payload.len(),
+            });
         }
 
-        let cmsgs: &[ControlMessage] = &[];
-        sendmmsg(
-            fd,
-            &mut self.headers,
-            &iovs,
-            &addrs,
-            cmsgs,
-            MsgFlags::empty(),
-        )
-        .context("sendmmsg")?;
+        // No more pushes to `iovecs` below, so pointers into it stay valid.
+        let iov_base = self.iovecs.as_mut_ptr();
+        self.msgs.clear();
+        for (k, m) in (next..end).enumerate() {
+            let dest = &self.dests[m % ndests];
+            let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+            hdr.msg_name = dest.as_ptr() as *mut libc::c_void;
+            hdr.msg_namelen = dest.len();
+            hdr.msg_iov = unsafe { iov_base.add(k) };
+            hdr.msg_iovlen = 1;
+            self.msgs.push(libc::mmsghdr {
+                msg_hdr: hdr,
+                msg_len: 0,
+            });
+        }
+    }
+}
 
-        Ok(())
+/// Drives chunked sends over `total` messages.
+///
+/// `send_chunk(next, end)` attempts messages `[next, end)` and returns how many
+/// the kernel accepted, or the error for the message at `next`. Policy:
+/// - `EINTR`: retry the same chunk.
+/// - `EBADF` / `ENOTSOCK`: the socket is unusable; return `Err`.
+/// - any other error: the message at `next` cannot be sent; skip it.
+/// - partial completion: advance past the accepted messages and retry from the
+///   next one, so its error (if any) surfaces on the following call. Linux
+///   explicitly permits retrying after a partial `sendmmsg`.
+fn run_send_loop<F>(total: usize, mut send_chunk: F) -> Result<SendReport>
+where
+    F: FnMut(usize, usize) -> io::Result<usize>,
+{
+    let mut report = SendReport::default();
+    let mut next = 0;
+
+    while next < total {
+        let end = (next + MAX_MSGS_PER_CALL).min(total);
+        match send_chunk(next, end) {
+            Ok(sent) => {
+                report.sent += sent;
+                next += sent;
+                if sent == 0 {
+                    // Defensive: the syscall reported nothing accepted without
+                    // an error; skip one message so the loop always progresses.
+                    report.dropped += 1;
+                    next += 1;
+                }
+            }
+            Err(e) => match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EBADF) | Some(libc::ENOTSOCK) => {
+                    return Err(e).context("sendmmsg: socket unusable");
+                }
+                _ => {
+                    log::debug!(
+                        "sendmmsg: message {}/{} failed: {}; skipping it",
+                        next + 1,
+                        total,
+                        e
+                    );
+                    report.dropped += 1;
+                    next += 1;
+                }
+            },
+        }
+    }
+
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(code: i32) -> io::Error {
+        io::Error::from_raw_os_error(code)
+    }
+
+    #[test]
+    fn full_chunks_do_not_skip_the_next_message() {
+        // 16 payloads x 65 destinations = 1040 messages: one full 1024 chunk
+        // followed by 16. A fully successful chunk must not drop message 1025.
+        let mut calls = Vec::new();
+        let report = run_send_loop(1040, |next, end| {
+            calls.push((next, end));
+            Ok(end - next)
+        })
+        .unwrap();
+        assert_eq!(calls, vec![(0, 1024), (1024, 1040)]);
+        assert_eq!(
+            report,
+            SendReport {
+                sent: 1040,
+                dropped: 0
+            }
+        );
+    }
+
+    #[test]
+    fn exact_chunk_boundaries() {
+        for total in [1, 1023, 1024, 1025, 2048] {
+            let report = run_send_loop(total, |next, end| Ok(end - next)).unwrap();
+            assert_eq!(
+                report,
+                SendReport {
+                    sent: total,
+                    dropped: 0
+                },
+                "total {}",
+                total
+            );
+        }
+    }
+
+    #[test]
+    fn partial_send_retries_then_skips_the_offender() {
+        // First call accepts 5 of 10; the retry from message 5 reports its
+        // error (EACCES); the rest then succeed.
+        let mut calls = 0;
+        let report = run_send_loop(10, |next, end| {
+            calls += 1;
+            match calls {
+                1 => Ok(5),
+                2 => {
+                    assert_eq!(next, 5);
+                    Err(err(libc::EACCES))
+                }
+                _ => Ok(end - next),
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            report,
+            SendReport {
+                sent: 9,
+                dropped: 1
+            }
+        );
+    }
+
+    #[test]
+    fn eintr_is_retried_without_dropping() {
+        let mut calls = 0;
+        let report = run_send_loop(3, |next, end| {
+            calls += 1;
+            if calls == 1 {
+                Err(err(libc::EINTR))
+            } else {
+                Ok(end - next)
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(
+            report,
+            SendReport {
+                sent: 3,
+                dropped: 0
+            }
+        );
+    }
+
+    #[test]
+    fn fatal_socket_error_is_returned() {
+        let result = run_send_loop(3, |_, _| Err(err(libc::EBADF)));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn zero_accepted_still_progresses() {
+        let mut calls = 0;
+        let report = run_send_loop(2, |next, end| {
+            calls += 1;
+            if calls == 1 { Ok(0) } else { Ok(end - next) }
+        })
+        .unwrap();
+        assert_eq!(
+            report,
+            SendReport {
+                sent: 1,
+                dropped: 1
+            }
+        );
     }
 }

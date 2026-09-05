@@ -10,7 +10,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use super::PacketSink;
 use super::batch::BatchedSender;
-use crate::worker::packet::Datagram;
+use crate::worker::packet::{Datagram, SendReport};
 
 /// Forwards with each original sender's address preserved, via a per-source
 /// transparent socket bound to that address (IP_TRANSPARENT /
@@ -24,12 +24,27 @@ pub(crate) struct SpoofSink {
 }
 
 impl SpoofSink {
-    pub(crate) fn new(destinations: &[SocketAddr], ttl: u8) -> Self {
-        Self {
+    pub(crate) fn new(destinations: &[SocketAddr], ttl: u8, is_ipv6: bool) -> Result<Self> {
+        // Verify at startup that we can set the transparent option (needs
+        // CAP_NET_ADMIN), so a privilege problem fails fast instead of on every
+        // packet's failed socket creation.
+        let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
+        let probe =
+            Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create spoof probe")?;
+        if is_ipv6 {
+            set_ipv6_transparent(&probe).context("set IPV6_TRANSPARENT (needs CAP_NET_ADMIN)")?;
+        } else {
+            probe
+                .set_ip_transparent_v4(true)
+                .context("set IP_TRANSPARENT (needs CAP_NET_ADMIN)")?;
+        }
+        drop(probe);
+
+        Ok(Self {
             cache: HashMap::new(),
             sender: BatchedSender::new(destinations),
             ttl,
-        }
+        })
     }
 
     /// Returns the raw fd of the transparent socket bound to `src`, creating
@@ -51,14 +66,14 @@ impl SpoofSink {
 }
 
 impl PacketSink for SpoofSink {
-    fn send_batch(&mut self, batch: &[Datagram]) {
+    fn send_batch(&mut self, batch: &[Datagram]) -> Result<SendReport> {
+        let mut report = SendReport::default();
         if batch.is_empty() {
-            return;
+            return Ok(report);
         }
 
-        // Group payloads by source: each source's packets go out its own socket,
-        // so a source's whole share of the batch fans out to every destination
-        // in one sendmmsg.
+        // Each source's packets go out its own socket, so group by source and
+        // fan each group out to every destination.
         let mut by_source: HashMap<SocketAddr, Vec<&[u8]>> = HashMap::new();
         for d in batch {
             by_source.entry(d.src).or_default().push(d.payload);
@@ -66,18 +81,13 @@ impl PacketSink for SpoofSink {
 
         for (src, payloads) in by_source {
             let Some(fd) = self.socket_for(src) else {
+                report.dropped += payloads.len() * self.sender.destination_count();
                 continue;
             };
-            log::debug!(
-                "Forwarding {} datagram(s) to {} destination(s) (spoofed source {})",
-                payloads.len(),
-                self.sender.destination_count(),
-                src
-            );
-            if let Err(e) = self.sender.send(fd, &payloads) {
-                log::error!("Failed to forward spoofed batch from {}: {}", src, e);
-            }
+            report.merge(self.sender.send(fd, &payloads)?);
         }
+
+        Ok(report)
     }
 }
 
@@ -108,12 +118,13 @@ fn make_spoof_socket(src: SocketAddr, ttl: u8) -> Result<Socket> {
     if src.is_ipv6() {
         set_ipv6_transparent(&sock).context("set IPV6_TRANSPARENT")?;
         sock.set_freebind_v6(true).context("set IPV6_FREEBIND")?;
-        sock.set_unicast_hops_v6(ttl as u32).ok();
+        sock.set_unicast_hops_v6(ttl as u32)
+            .context("set IPv6 hop limit")?;
     } else {
         sock.set_ip_transparent_v4(true)
             .context("set IP_TRANSPARENT")?;
         sock.set_freebind_v4(true).context("set IP_FREEBIND")?;
-        sock.set_ttl_v4(ttl as u32).ok();
+        sock.set_ttl_v4(ttl as u32).context("set IPv4 TTL")?;
     }
 
     sock.bind(&src.into())

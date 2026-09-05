@@ -1,13 +1,17 @@
+use std::any::Any;
 use std::net::SocketAddr;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::mpsc;
 use std::thread;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nix::unistd::daemon;
 use socket2::{Domain, Protocol, Socket, Type};
 use udp_forward::cli::Args;
 use udp_forward::worker::Worker;
 
+/// Logs go to stderr by default (where a service manager such as systemd
+/// collects them); `--logfile` redirects them to a file instead.
 fn init_logger(logfile: Option<&std::path::Path>) -> Result<()> {
     let mut builder = env_logger::Builder::from_default_env();
 
@@ -49,27 +53,29 @@ fn check_listen_port(addr: SocketAddr) -> Result<()> {
     }
 }
 
+/// A worker's whole life: initialize, then forward until a fatal error.
+fn run_worker(args: &Args) -> Result<()> {
+    Worker::new(args)?.run()
+}
+
+/// The payload of an unwinding panic, as text.
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
     init_logger(args.logfile.as_deref())?;
 
-    if args.fork {
-        if args.logfile.is_none() {
-            log::warn!("--fork without --logfile: log output will be discarded");
-        }
-        daemon(false, false).context("Failed to daemonize")?;
-    }
-
-    if let Some(ref pidfile) = args.pidfile {
-        let pid = std::process::id();
-
-        std::fs::write(pidfile, pid.to_string())
-            .with_context(|| format!("Failed to write PID to {}", pidfile.display()))?;
-
-        log::info!("PID {} written to {}", pid, pidfile.display());
-    }
-
+    // Validate the configuration before starting workers so a bad setup fails
+    // fast with a clear error and a non-zero exit.
     let is_ipv6 = args.listen.is_ipv6();
     for dest in &args.destinations {
         if dest.is_ipv6() != is_ipv6 {
@@ -101,30 +107,31 @@ fn main() -> Result<()> {
     log::info!("Config: {:?}", args);
     log::info!("Starting {} worker thread(s)", workers);
 
-    let mut handles = Vec::with_capacity(workers);
-
-    for i in 0..workers {
+    // Each worker sends exactly one termination result, whether initialization
+    // failed, forwarding failed, or the worker panicked. `catch_unwind` is used
+    // only here, at the thread boundary; ordinary failures stay as `Result`.
+    let (tx, rx) = mpsc::channel::<(usize, Result<(), String>)>();
+    for id in 0..workers {
         let args = args.clone();
-        let handle = thread::Builder::new()
-            .name(format!("worker-{}", i))
+        let tx = tx.clone();
+        thread::Builder::new()
+            .name(format!("worker-{}", id))
             .spawn(move || {
-                let worker = match Worker::new(&args) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        log::error!("Failed to create worker {}: {}", i, e);
-                        return;
-                    }
+                let outcome = match panic::catch_unwind(AssertUnwindSafe(|| run_worker(&args))) {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(format!("{:#}", e)),
+                    Err(payload) => Err(format!("panicked: {}", panic_message(payload))),
                 };
-                if let Err(e) = worker.run() {
-                    log::error!("Worker {} error: {}", i, e);
-                }
+                let _ = tx.send((id, outcome));
             })?;
-        handles.push(handle);
     }
+    drop(tx);
 
-    for handle in handles {
-        handle.join().expect("Worker thread panicked");
+    // A worker stopping means lost capacity (or a failed start), so the first
+    // one ends the process with an error; a service manager can then restart it.
+    match rx.recv() {
+        Ok((id, Ok(()))) => anyhow::bail!("Worker {} exited unexpectedly", id),
+        Ok((id, Err(e))) => anyhow::bail!("Worker {} failed: {}", id, e),
+        Err(_) => Ok(()),
     }
-
-    Ok(())
 }

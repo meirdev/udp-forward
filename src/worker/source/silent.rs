@@ -1,13 +1,13 @@
 //! Silent receive: an AF_PACKET capture socket that taps at the device layer,
 //! like tcpdump, plus the in-kernel BPF filter and packet parsing it needs.
 
-use std::net::{IpAddr, SocketAddr};
-use std::ops::Range;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 
 use anyhow::{Context, Result};
+use nix::sys::socket::SockaddrStorage;
 use pnet_packet::ip::IpNextHeaderProtocols;
-use pnet_packet::ipv4::Ipv4Packet;
+use pnet_packet::ipv4::{Ipv4Flags, Ipv4Packet};
 use pnet_packet::ipv6::Ipv6Packet;
 use pnet_packet::udp::UdpPacket;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -27,8 +27,7 @@ const SO_ATTACH_FILTER: libc::c_int = 26;
 pub(crate) struct SilentSource {
     socket: Socket,
     rx: BatchedReceiver,
-    is_ipv6: bool,
-    listen_port: u16,
+    listen: SocketAddr,
 }
 
 impl SilentSource {
@@ -37,13 +36,24 @@ impl SilentSource {
         interface: Option<&str>,
         buffer_size: usize,
     ) -> Result<Self> {
-        let is_ipv6 = listen.is_ipv6();
-        let socket = new_capture_socket(is_ipv6, interface, listen.port())?;
+        // A scoped IPv6 listen address (`[fe80::1%3]`) names an interface; it
+        // must agree with `--interface` when both are given.
+        if let (SocketAddr::V6(l), Some(iface)) = (listen, interface)
+            && l.scope_id() != 0
+            && ifindex_of(iface)? != l.scope_id()
+        {
+            anyhow::bail!(
+                "listen address scope %{} does not match --interface {}",
+                l.scope_id(),
+                iface
+            );
+        }
+
+        let socket = new_capture_socket(listen.is_ipv6(), interface, listen.port())?;
         Ok(Self {
             socket,
             rx: BatchedReceiver::new(buffer_size),
-            is_ipv6,
-            listen_port: listen.port(),
+            listen,
         })
     }
 }
@@ -52,24 +62,62 @@ impl PacketSource for SilentSource {
     fn recv_batch(&mut self) -> Result<Vec<Datagram<'_>>> {
         // AF_PACKET SOCK_DGRAM delivers each packet starting at the IP header
         // (the link-layer header is stripped in cooked mode). The BPF filter
-        // drops non-matching packets in the kernel; the parse here is the
-        // backstop (and handles the IPv6-extension-header case). The capture
-        // address is ignored; the real source is parsed from the packet.
-        let fd = self.socket.as_raw_fd();
-        let n = self.rx.recv(fd)?;
+        // drops non-UDP and wrong-port packets in the kernel; the parser here
+        // enforces the listen address, rejects fragments and malformed lengths,
+        // and reconstructs the source (the capture address is the interface,
+        // not the datagram's sender).
+        let n = self.rx.recv(self.socket.as_raw_fd())?;
 
         let mut batch = Vec::with_capacity(n);
-        for i in 0..n {
-            let (_addr, data) = self.rx.get(i);
-            log::debug!("Silent: captured raw frame of {} bytes", data.len());
-            if let Some((src, range)) = parse_captured_udp(data, self.is_ipv6, self.listen_port) {
-                let payload = &data[range];
-                log::debug!("Received {} bytes from {} (silent)", payload.len(), src);
-                batch.push(Datagram { src, payload });
+        for received in self.rx.received() {
+            if received.truncated {
+                log::debug!("Silent: dropping truncated capture (increase --buffer-size)");
+                continue;
             }
+            let ifindex = capture_ifindex(received.addr);
+            if !listen_scope_matches(self.listen, ifindex) {
+                continue;
+            }
+            let Some(mut datagram) = parse_captured_udp(received.data, self.listen) else {
+                continue;
+            };
+            attach_link_local_scope(&mut datagram.src, ifindex);
+            batch.push(datagram);
         }
         Ok(batch)
     }
+}
+
+/// The interface a datagram was captured on, from its AF_PACKET link address.
+fn capture_ifindex(addr: Option<SockaddrStorage>) -> Option<u32> {
+    addr.and_then(|a| a.as_link_addr().map(|l| l.ifindex() as u32))
+}
+
+/// A scoped IPv6 listen address only accepts datagrams captured on that
+/// interface; an unscoped or IPv4 listen address accepts any interface.
+fn listen_scope_matches(listen: SocketAddr, capture_ifindex: Option<u32>) -> bool {
+    match listen {
+        SocketAddr::V6(l) if l.scope_id() != 0 => capture_ifindex == Some(l.scope_id()),
+        _ => true,
+    }
+}
+
+/// A link-local IPv6 source is only meaningful with its interface scope, which
+/// the packet itself does not carry; take it from where the packet was
+/// captured.
+fn attach_link_local_scope(src: &mut SocketAddr, capture_ifindex: Option<u32>) {
+    if let SocketAddr::V6(v6) = src
+        && is_link_local_v6(*v6.ip())
+        && v6.scope_id() == 0
+        && let Some(ifindex) = capture_ifindex
+    {
+        v6.set_scope_id(ifindex);
+    }
+}
+
+/// Whether an IPv6 address is in the link-local unicast range (fe80::/10).
+fn is_link_local_v6(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
 /// Creates an AF_PACKET capture socket for silent mode.
@@ -107,8 +155,9 @@ fn new_capture_socket(is_ipv6: bool, interface: Option<&str>, listen_port: u16) 
 
     match interface {
         Some(iface) => {
-            sock.bind_device(Some(iface.as_bytes()))
-                .with_context(|| format!("bind capture to interface {}", iface))?;
+            // SO_BINDTODEVICE does not restrict packet sockets; bind a
+            // sockaddr_ll with the interface index instead.
+            bind_to_interface(&sock, ethertype, iface)?;
             log::info!(
                 "AF_PACKET capture for UDP port {} on interface {} ({})",
                 listen_port,
@@ -128,51 +177,137 @@ fn new_capture_socket(is_ipv6: bool, interface: Option<&str>, listen_port: u16) 
     Ok(sock)
 }
 
-/// Parses a captured IP + UDP packet, returning the sender address and the byte
-/// range of the UDP payload within `data` when it is a UDP datagram addressed
-/// to `listen_port`.
-///
-/// A range (rather than a borrowed slice) is returned so the caller can release
-/// its borrow of the receive buffer before reacquiring just the payload. The
-/// range is bounded by the UDP length field, which strips any link-layer
-/// padding (e.g. Ethernet's 60-byte minimum frame). Returns `None` for anything
-/// that is not a matching UDP datagram.
-fn parse_captured_udp(
-    data: &[u8],
-    is_ipv6: bool,
-    listen_port: u16,
-) -> Option<(SocketAddr, Range<usize>)> {
-    let (ip_header_len, src_ip) = if is_ipv6 {
-        let ip = Ipv6Packet::new(data)?;
-        if ip.get_next_header() != IpNextHeaderProtocols::Udp {
-            return None;
-        }
-        // Only UDP directly after the IPv6 header (no extension headers).
-        (IPV6_HEADER_LEN, IpAddr::V6(ip.get_source()))
-    } else {
-        let ip = Ipv4Packet::new(data)?;
-        if ip.get_next_level_protocol() != IpNextHeaderProtocols::Udp {
-            return None;
-        }
-        (
-            (ip.get_header_length() as usize) * 4,
-            IpAddr::V4(ip.get_source()),
+/// Resolves an interface name to its index.
+fn ifindex_of(iface: &str) -> Result<u32> {
+    let cname = std::ffi::CString::new(iface).context("interface name has interior NUL")?;
+    let ifindex = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    if ifindex == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("unknown interface {}", iface));
+    }
+    Ok(ifindex)
+}
+
+/// Binds an AF_PACKET socket to a single interface by index, the supported way
+/// to restrict a packet socket's capture to one interface.
+fn bind_to_interface(sock: &Socket, ethertype: u16, iface: &str) -> Result<()> {
+    let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    sll.sll_family = libc::AF_PACKET as u16;
+    sll.sll_protocol = ethertype.to_be();
+    sll.sll_ifindex = ifindex_of(iface)? as i32;
+
+    let ret = unsafe {
+        libc::bind(
+            sock.as_raw_fd(),
+            &sll as *const libc::sockaddr_ll as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
         )
     };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("bind capture to interface {}", iface));
+    }
 
-    let udp = UdpPacket::new(data.get(ip_header_len..)?)?;
-    if udp.get_destination() != listen_port {
+    Ok(())
+}
+
+/// The validated IP layer of a captured packet.
+struct IpEnvelope {
+    header_len: usize,
+    /// Length of the IP packet itself; captured bytes beyond it are link-layer
+    /// padding and must never be read as payload.
+    total: usize,
+    src: IpAddr,
+    dst: IpAddr,
+}
+
+/// Validates an IPv4 header and confirms it carries an unfragmented UDP
+/// datagram. Packet sockets do not reassemble fragments: a fragment has a
+/// non-zero offset or the More Fragments flag, only its first piece carries a
+/// UDP header, and that header's length covers the whole datagram, so
+/// forwarding any fragment would emit corrupted data.
+fn parse_ipv4(data: &[u8]) -> Option<IpEnvelope> {
+    let ip = Ipv4Packet::new(data)?;
+    if ip.get_version() != 4 {
+        return None;
+    }
+    let header_len = (ip.get_header_length() as usize) * 4;
+    if header_len < 20 {
+        return None;
+    }
+    if ip.get_next_level_protocol() != IpNextHeaderProtocols::Udp {
+        return None;
+    }
+    if ip.get_fragment_offset() != 0 || (ip.get_flags() & Ipv4Flags::MoreFragments) != 0 {
+        log::debug!("Silent: dropping IPv4 fragment from {}", ip.get_source());
+        return None;
+    }
+    Some(IpEnvelope {
+        header_len,
+        total: ip.get_total_length() as usize,
+        src: IpAddr::V4(ip.get_source()),
+        dst: IpAddr::V4(ip.get_destination()),
+    })
+}
+
+/// Validates an IPv6 header and confirms UDP follows it directly. Extension
+/// headers (including fragments) are not reassembled; such packets are dropped.
+fn parse_ipv6(data: &[u8]) -> Option<IpEnvelope> {
+    let ip = Ipv6Packet::new(data)?;
+    if ip.get_version() != 6 {
+        return None;
+    }
+    if ip.get_next_header() != IpNextHeaderProtocols::Udp {
+        return None;
+    }
+    Some(IpEnvelope {
+        header_len: IPV6_HEADER_LEN,
+        total: IPV6_HEADER_LEN + ip.get_payload_length() as usize,
+        src: IpAddr::V6(ip.get_source()),
+        dst: IpAddr::V6(ip.get_destination()),
+    })
+}
+
+/// Parses a captured IP + UDP packet into a [`Datagram`] when it is a UDP
+/// datagram addressed to `listen`. Enforces the listen port always and the
+/// listen IP unless it is the wildcard address. Bounds all UDP parsing by the
+/// IP-declared length so link-layer padding is never read as payload.
+fn parse_captured_udp(data: &[u8], listen: SocketAddr) -> Option<Datagram<'_>> {
+    let ip = if listen.is_ipv6() {
+        parse_ipv6(data)?
+    } else {
+        parse_ipv4(data)?
+    };
+
+    // The IP packet must hold at least a UDP header and must not claim more
+    // bytes than were captured.
+    if ip.total < ip.header_len + UDP_HEADER_LEN || ip.total > data.len() {
         return None;
     }
 
-    let src = SocketAddr::new(src_ip, udp.get_source());
-    let payload_start = ip_header_len + UDP_HEADER_LEN;
-    let payload_end = (ip_header_len + udp.get_length() as usize).min(data.len());
-    if payload_start > payload_end {
+    if !listen.ip().is_unspecified() && ip.dst != listen.ip() {
         return None;
     }
 
-    Some((src, payload_start..payload_end))
+    let udp = UdpPacket::new(&data[ip.header_len..ip.total])?;
+    if udp.get_destination() != listen.port() {
+        return None;
+    }
+
+    // The UDP length covers header + payload and must fit within the IP packet.
+    let udp_len = udp.get_length() as usize;
+    if udp_len < UDP_HEADER_LEN {
+        return None;
+    }
+    let end = ip.header_len + udp_len;
+    if end > ip.total {
+        return None;
+    }
+
+    Some(Datagram {
+        src: SocketAddr::new(ip.src, udp.get_source()),
+        payload: &data[ip.header_len + UDP_HEADER_LEN..end],
+    })
 }
 
 // A classic BPF instruction (struct sock_filter).
@@ -274,7 +409,8 @@ const fn create_bpf_filter_ipv4(port: u16) -> [SockFilter; 7] {
 
 /// Classic BPF that accepts UDP datagrams with destination `port`, assuming the
 /// data starts at a 40-byte IPv6 header with no extension headers. Packets with
-/// extension headers are rejected here and fall to the userspace check.
+/// extension headers have a non-UDP next-header value, so they are dropped in
+/// the kernel and never delivered (silent mode does not reassemble them).
 const fn create_bpf_filter_ipv6(port: u16) -> [SockFilter; 6] {
     [
         // Load byte at offset 6 (IPv6 Next Header field).
@@ -321,4 +457,128 @@ const fn create_bpf_filter_ipv6(port: u16) -> [SockFilter; 6] {
             k: 0,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddrV6};
+
+    use super::*;
+
+    /// Builds an IPv4 + UDP packet (as an AF_PACKET SOCK_DGRAM capture would
+    /// deliver it) with the given fragmentation flags/offset word and payload.
+    fn ipv4_udp(flags_frag: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+        let total = 20 + 8 + payload.len();
+        let mut p = vec![0u8; total];
+        p[0] = 0x45; // version 4, IHL 5
+        p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        p[6..8].copy_from_slice(&flags_frag.to_be_bytes());
+        p[8] = 64; // TTL
+        p[9] = 17; // UDP
+        p[12..16].copy_from_slice(&[127, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[127, 0, 0, 1]);
+        p[20..22].copy_from_slice(&1234u16.to_be_bytes()); // src port
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        p[28..].copy_from_slice(payload);
+        p
+    }
+
+    fn wildcard(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
+    }
+
+    #[test]
+    fn accepts_unfragmented_udp() {
+        let pkt = ipv4_udp(0x0000, 4400, b"hello");
+        let d = parse_captured_udp(&pkt, wildcard(4400)).expect("should parse");
+        assert_eq!(d.src.port(), 1234);
+        assert_eq!(d.payload, b"hello");
+    }
+
+    #[test]
+    fn rejects_first_fragment() {
+        // More Fragments flag set (0x2000), offset 0.
+        let pkt = ipv4_udp(0x2000, 4400, b"hello");
+        assert!(parse_captured_udp(&pkt, wildcard(4400)).is_none());
+    }
+
+    #[test]
+    fn rejects_later_fragment() {
+        // Non-zero fragment offset (2 * 8 bytes).
+        let pkt = ipv4_udp(0x0002, 4400, b"hello");
+        assert!(parse_captured_udp(&pkt, wildcard(4400)).is_none());
+    }
+
+    #[test]
+    fn rejects_wrong_port() {
+        let pkt = ipv4_udp(0x0000, 9999, b"hello");
+        assert!(parse_captured_udp(&pkt, wildcard(4400)).is_none());
+    }
+
+    #[test]
+    fn enforces_specific_listen_ip() {
+        // Packet is addressed to 127.0.0.1 (see `ipv4_udp`).
+        let pkt = ipv4_udp(0x0000, 4400, b"hello");
+        let matching: SocketAddr = "127.0.0.1:4400".parse().unwrap();
+        let other: SocketAddr = "127.0.0.2:4400".parse().unwrap();
+        assert!(parse_captured_udp(&pkt, matching).is_some());
+        assert!(parse_captured_udp(&pkt, other).is_none());
+    }
+
+    #[test]
+    fn rejects_declared_length_beyond_capture() {
+        // Claim a UDP length longer than the bytes actually present.
+        let mut pkt = ipv4_udp(0x0000, 4400, b"hello");
+        pkt[24..26].copy_from_slice(&(8 + 100u16).to_be_bytes());
+        assert!(parse_captured_udp(&pkt, wildcard(4400)).is_none());
+    }
+
+    #[test]
+    fn ignores_link_layer_padding() {
+        // A short datagram padded to a larger frame: the UDP length claims into
+        // the padding, but the IP total length bounds it out.
+        let mut pkt = ipv4_udp(0x0000, 4400, b"hi");
+        pkt[24..26].copy_from_slice(&(8 + 50u16).to_be_bytes()); // bogus UDP length
+        pkt.extend(std::iter::repeat_n(0u8, 50)); // link-layer padding
+        assert!(parse_captured_udp(&pkt, wildcard(4400)).is_none());
+    }
+
+    #[test]
+    fn scoped_listen_requires_matching_capture_interface() {
+        let scoped = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 5000, 0, 3));
+        assert!(listen_scope_matches(scoped, Some(3)));
+        assert!(!listen_scope_matches(scoped, Some(4)));
+        assert!(!listen_scope_matches(scoped, None));
+        // Unscoped and IPv4 listen addresses accept any interface.
+        assert!(listen_scope_matches(wildcard(5000), Some(7)));
+        assert!(listen_scope_matches(
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 5000, 0, 0)),
+            None
+        ));
+    }
+
+    #[test]
+    fn link_local_source_gets_capture_scope() {
+        let mut src = SocketAddr::V6(SocketAddrV6::new("fe80::abcd".parse().unwrap(), 1, 0, 0));
+        attach_link_local_scope(&mut src, Some(9));
+        assert_eq!(
+            match src {
+                SocketAddr::V6(v6) => v6.scope_id(),
+                _ => unreachable!(),
+            },
+            9
+        );
+
+        // A global address is left alone.
+        let mut global = SocketAddr::V6(SocketAddrV6::new("2001:db8::1".parse().unwrap(), 1, 0, 0));
+        attach_link_local_scope(&mut global, Some(9));
+        assert_eq!(
+            match global {
+                SocketAddr::V6(v6) => v6.scope_id(),
+                _ => unreachable!(),
+            },
+            0
+        );
+    }
 }

@@ -1,8 +1,8 @@
 //! A worker wires one [`PacketSource`] (how packets are received) to one
 //! [`PacketSink`] (how they are forwarded). The two concerns are independent:
 //! receiving normally or silently, and sending normally or spoofed, combine
-//! freely. Work flows in batches: one `recvmmsg` fills a batch, one (or a few)
-//! `sendmmsg` calls drain it.
+//! freely. Work flows in batches: one `recvmmsg` fills a batch, and the sink
+//! fans it out with `sendmmsg`.
 
 mod packet;
 mod sink;
@@ -32,7 +32,11 @@ impl Worker {
         };
 
         let sink: Box<dyn PacketSink> = if args.spoof {
-            Box::new(SpoofSink::new(&args.destinations, args.ttl))
+            Box::new(SpoofSink::new(
+                &args.destinations,
+                args.ttl,
+                args.listen.is_ipv6(),
+            )?)
         } else {
             Box::new(NormalSink::new(
                 args.listen.is_ipv6(),
@@ -44,10 +48,19 @@ impl Worker {
         Ok(Self { source, sink })
     }
 
+    /// Runs until a fatal source or sink error. Per-message send failures are
+    /// summarized per batch rather than logged individually.
     pub fn run(mut self) -> Result<()> {
         loop {
             let batch = self.source.recv_batch()?;
-            self.sink.send_batch(&batch);
+            let report = self.sink.send_batch(&batch)?;
+            if report.dropped > 0 {
+                log::warn!(
+                    "batch: {} message(s) sent, {} dropped",
+                    report.sent,
+                    report.dropped
+                );
+            }
         }
     }
 }
