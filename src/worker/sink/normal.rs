@@ -9,6 +9,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use super::PacketSink;
 use super::batch::BatchedSender;
+use crate::worker::packet::Datagram;
 
 /// Forwards from the forwarder's own address via a single shared socket.
 pub(crate) struct NormalSink {
@@ -33,15 +34,21 @@ impl NormalSink {
 }
 
 impl PacketSink for NormalSink {
-    fn send(&mut self, payload: &[u8], _src: SocketAddr) {
+    fn send_batch(&mut self, batch: &[Datagram]) {
+        if batch.is_empty() {
+            return;
+        }
+        // All payloads go out the one socket, so the whole batch fans out to
+        // every destination in a single sendmmsg.
         let fd = self.socket.as_raw_fd();
+        let payloads: Vec<&[u8]> = batch.iter().map(|d| d.payload).collect();
         log::debug!(
-            "Forwarding {} bytes to {} destination(s) (normal)",
-            payload.len(),
+            "Forwarding {} datagram(s) to {} destination(s) (normal)",
+            batch.len(),
             self.sender.destination_count()
         );
-        if let Err(e) = self.sender.send_to_all(fd, payload) {
-            log::error!("Failed to forward {} bytes: {}", payload.len(), e);
+        if let Err(e) = self.sender.send(fd, &payloads) {
+            log::error!("Failed to forward batch: {}", e);
         }
     }
 }

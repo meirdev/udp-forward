@@ -8,6 +8,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use super::PacketSource;
 use super::batch::{BatchedReceiver, source_addr};
+use crate::worker::packet::Datagram;
 
 /// Receives on a UDP socket bound to the listen address.
 pub(crate) struct NormalSource {
@@ -33,11 +34,21 @@ impl NormalSource {
 }
 
 impl PacketSource for NormalSource {
-    fn next_packet(&mut self) -> Result<(SocketAddr, &[u8])> {
+    fn recv_batch(&mut self) -> Result<Vec<Datagram<'_>>> {
         let fd = self.socket.as_raw_fd();
-        let (addr, payload) = self.rx.next(fd)?;
-        let src = source_addr(addr)?;
-        log::debug!("Received {} bytes from {}", payload.len(), src);
-        Ok((src, payload))
+        let n = self.rx.recv(fd)?;
+
+        let mut batch = Vec::with_capacity(n);
+        for i in 0..n {
+            let (addr, payload) = self.rx.get(i);
+            match source_addr(addr) {
+                Ok(src) => {
+                    log::debug!("Received {} bytes from {}", payload.len(), src);
+                    batch.push(Datagram { src, payload });
+                }
+                Err(e) => log::warn!("Dropping datagram with unusable source: {}", e),
+            }
+        }
+        Ok(batch)
     }
 }

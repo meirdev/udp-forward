@@ -7,14 +7,14 @@ mod batch;
 mod normal;
 mod spoof;
 
-use std::net::SocketAddr;
-
 pub(crate) use normal::NormalSink;
 pub(crate) use spoof::SpoofSink;
 
-/// Where packets go: how a payload is forwarded to the destinations, either
-/// with the forwarder's own address as the source (normal) or with the original
-/// sender's address preserved (spoof).
+use crate::worker::packet::Datagram;
+
+/// Where packets go: how a batch of datagrams is forwarded to the destinations,
+/// either with the forwarder's own address as the source (normal) or with each
+/// original sender's address preserved (spoof).
 pub(crate) trait PacketSink {
-    fn send(&mut self, payload: &[u8], src: SocketAddr);
+    fn send_batch(&mut self, batch: &[Datagram]);
 }

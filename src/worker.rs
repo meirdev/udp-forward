@@ -1,8 +1,10 @@
 //! A worker wires one [`PacketSource`] (how packets are received) to one
 //! [`PacketSink`] (how they are forwarded). The two concerns are independent:
 //! receiving normally or silently, and sending normally or spoofed, combine
-//! freely.
+//! freely. Work flows in batches: one `recvmmsg` fills a batch, one (or a few)
+//! `sendmmsg` calls drain it.
 
+mod packet;
 mod sink;
 mod source;
 
@@ -44,8 +46,8 @@ impl Worker {
 
     pub fn run(mut self) -> Result<()> {
         loop {
-            let (src, payload) = self.source.next_packet()?;
-            self.sink.send(payload, src);
+            let batch = self.source.recv_batch()?;
+            self.sink.send_batch(&batch);
         }
     }
 }

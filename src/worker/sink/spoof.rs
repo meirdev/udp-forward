@@ -1,17 +1,18 @@
-//! Spoof send: preserves the original sender's address via per-source
+//! Spoof send: preserves each original sender's address via per-source
 //! transparent sockets (IP_TRANSPARENT / IPV6_TRANSPARENT).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use super::PacketSink;
 use super::batch::BatchedSender;
+use crate::worker::packet::Datagram;
 
-/// Forwards with the original sender's address preserved, via a per-source
+/// Forwards with each original sender's address preserved, via a per-source
 /// transparent socket bound to that address (IP_TRANSPARENT /
 /// IPV6_TRANSPARENT).
 pub(crate) struct SpoofSink {
@@ -30,37 +31,52 @@ impl SpoofSink {
             ttl,
         }
     }
+
+    /// Returns the raw fd of the transparent socket bound to `src`, creating
+    /// and caching it on first use. `None` if the socket cannot be created.
+    fn socket_for(&mut self, src: SocketAddr) -> Option<RawFd> {
+        if !self.cache.contains_key(&src) {
+            match make_spoof_socket(src, self.ttl) {
+                Ok(sock) => {
+                    self.cache.insert(src, sock);
+                }
+                Err(e) => {
+                    log::error!("Failed to create spoof socket for source {}: {}", src, e);
+                    return None;
+                }
+            }
+        }
+        Some(self.cache[&src].as_raw_fd())
+    }
 }
 
 impl PacketSink for SpoofSink {
-    fn send(&mut self, payload: &[u8], src: SocketAddr) {
-        if !self.cache.contains_key(&src) {
-            let sock = match make_spoof_socket(src, self.ttl) {
-                Ok(sock) => sock,
-                Err(e) => {
-                    log::error!("Failed to create spoof socket for source {}: {}", src, e);
-                    return;
-                }
-            };
-            self.cache.insert(src, sock);
+    fn send_batch(&mut self, batch: &[Datagram]) {
+        if batch.is_empty() {
+            return;
         }
 
-        // All destinations for this source go out its socket, so one sendmmsg
-        // fans the payload out to every one of them.
-        let fd = self.cache[&src].as_raw_fd();
-        log::debug!(
-            "Forwarding {} bytes to {} destination(s) (spoofed source {})",
-            payload.len(),
-            self.sender.destination_count(),
-            src
-        );
-        if let Err(e) = self.sender.send_to_all(fd, payload) {
-            log::error!(
-                "Failed to forward spoofed {} bytes from {}: {}",
-                payload.len(),
-                src,
-                e
+        // Group payloads by source: each source's packets go out its own socket,
+        // so a source's whole share of the batch fans out to every destination
+        // in one sendmmsg.
+        let mut by_source: HashMap<SocketAddr, Vec<&[u8]>> = HashMap::new();
+        for d in batch {
+            by_source.entry(d.src).or_default().push(d.payload);
+        }
+
+        for (src, payloads) in by_source {
+            let Some(fd) = self.socket_for(src) else {
+                continue;
+            };
+            log::debug!(
+                "Forwarding {} datagram(s) to {} destination(s) (spoofed source {})",
+                payloads.len(),
+                self.sender.destination_count(),
+                src
             );
+            if let Err(e) = self.sender.send(fd, &payloads) {
+                log::error!("Failed to forward spoofed batch from {}: {}", src, e);
+            }
         }
     }
 }

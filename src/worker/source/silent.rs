@@ -14,6 +14,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use super::PacketSource;
 use super::batch::BatchedReceiver;
+use crate::worker::packet::Datagram;
 
 // Fixed IPv6 header length (no extension headers). libc has no constant for it.
 const IPV6_HEADER_LEN: usize = 40;
@@ -48,29 +49,26 @@ impl SilentSource {
 }
 
 impl PacketSource for SilentSource {
-    fn next_packet(&mut self) -> Result<(SocketAddr, &[u8])> {
-        // AF_PACKET SOCK_DGRAM delivers the packet starting at the IP header
+    fn recv_batch(&mut self) -> Result<Vec<Datagram<'_>>> {
+        // AF_PACKET SOCK_DGRAM delivers each packet starting at the IP header
         // (the link-layer header is stripped in cooked mode). The BPF filter
         // drops non-matching packets in the kernel; the parse here is the
         // backstop (and handles the IPv6-extension-header case). The capture
         // address is ignored; the real source is parsed from the packet.
-        loop {
-            let fd = self.socket.as_raw_fd();
-            // Parse into an owned (src, payload range) so the borrow from
-            // `next` is released before the next loop iteration; the matching
-            // slice is reacquired via `last_slice` once we're ready to return.
-            let parsed = {
-                let (_addr, data) = self.rx.next(fd)?;
-                log::debug!("Silent: captured raw frame of {} bytes", data.len());
-                parse_captured_udp(data, self.is_ipv6, self.listen_port)
-            };
+        let fd = self.socket.as_raw_fd();
+        let n = self.rx.recv(fd)?;
 
-            if let Some((src, range)) = parsed {
-                let payload = self.rx.last_slice(range);
+        let mut batch = Vec::with_capacity(n);
+        for i in 0..n {
+            let (_addr, data) = self.rx.get(i);
+            log::debug!("Silent: captured raw frame of {} bytes", data.len());
+            if let Some((src, range)) = parse_captured_udp(data, self.is_ipv6, self.listen_port) {
+                let payload = &data[range];
                 log::debug!("Received {} bytes from {} (silent)", payload.len(), src);
-                return Ok((src, payload));
+                batch.push(Datagram { src, payload });
             }
         }
+        Ok(batch)
     }
 }
 
