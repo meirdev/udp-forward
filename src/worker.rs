@@ -188,6 +188,11 @@ impl Worker {
         };
 
         let send_socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        if is_ipv6 {
+            send_socket.set_unicast_hops_v6(args.ttl as u32)?;
+        } else {
+            send_socket.set_ttl_v4(args.ttl as u32)?;
+        }
 
         let raw_send_socket = if args.spoof && !is_ipv6 {
             let sock = Socket::new(domain, Type::RAW, Some(Protocol::UDP))?;
