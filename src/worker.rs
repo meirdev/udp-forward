@@ -236,7 +236,7 @@ impl Worker {
         };
 
         let recv_buf = vec![MaybeUninit::uninit(); args.buffer_size];
-        let send_buf = vec![0u8; args.buffer_size];
+        let send_buf = vec![0u8; args.buffer_size + IPV6_HEADER_LEN + UDP_HEADER_LEN];
 
         Ok(Self {
             recv_socket,
