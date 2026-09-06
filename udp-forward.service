@@ -1,0 +1,15 @@
+[Unit]
+Description=UDP forwarder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/udp-forward -l 0.0.0.0:5000 192.168.1.10:6000
+Environment=RUST_LOG=info
+Restart=on-failure
+DynamicUser=yes
+# Only needed for --spoof (CAP_NET_ADMIN) and/or --silent (CAP_NET_RAW):
+# AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

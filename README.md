@@ -1,16 +1,17 @@
 # udp-forward
 
-A lightweight, multi-threaded UDP packet forwarder written in Rust (Linux only).
+A lightweight UDP forwarder for Linux, written in Rust. Forward packets to one
+or more destinations, optionally preserving the original sender's address or
+capturing traffic without binding the listening port.
 
-`udp-forward` listens for incoming UDP packets and forwards them to one or more
-destination addresses. It supports source spoofing, a silent sniffing mode,
-configurable TTL, and worker threads. Logs go to stderr (controlled by
-`RUST_LOG`, e.g. `RUST_LOG=info`), which a service manager such as systemd
-collects for you.
+## Build
 
-## Examples
+```bash
+cargo build --release
+sudo install -m 755 target/release/udp-forward /usr/local/bin/udp-forward
+```
 
-### Basic Forwarding
+## Usage
 
 Listen on port 5000 and forward to one destination:
 
@@ -18,78 +19,72 @@ Listen on port 5000 and forward to one destination:
 udp-forward -l 0.0.0.0:5000 192.168.1.10:6000
 ```
 
----
-
-### Forward to Multiple Destinations
+Add destinations to send a copy of each packet to each address:
 
 ```bash
-udp-forward -l 0.0.0.0:5000 \
-  192.168.1.10:6000 \
-  192.168.1.20:6000
+udp-forward -l 0.0.0.0:5000 192.168.1.10:6000 192.168.1.20:6000
 ```
 
----
+IPv4 and IPv6 are supported. The listening address and all destinations must
+use the same address family. Use `udp-forward --help` for all options, including
+worker count, TTL, and packet buffer size.
 
-### Enable Source Spoofing
+### Preserve the sender's address
 
 ```bash
 sudo udp-forward -l 0.0.0.0:5000 --spoof 192.168.1.10:6000
 ```
 
-The destination sees the original sender's address (IP and port) as the source.
-Spoofing uses transparent sockets (`IP_TRANSPARENT` / `IPV6_TRANSPARENT`), so the
-kernel builds the headers and routes normally across any interface, IPv6
-included. This requires `CAP_NET_ADMIN`. The upstream network path may still
-drop packets with a non-local source (BCP38 / uRPF).
+The destination sees the original sender's IP and port. Spoofing uses transparent
+UDP sockets and requires `CAP_NET_ADMIN`. The network may still drop packets
+with a non-local source address.
 
----
+### Capture without binding
 
-### Silent Sniff Mode
-
-Allows other programs to bind to the same port:
+Silent mode lets another program bind to the listening port:
 
 ```bash
 sudo udp-forward -l 0.0.0.0:5000 --silent 192.168.1.10:6000
 ```
 
-Silent mode captures at the device layer with an `AF_PACKET` socket, exactly like
-`tcpdump`, so packets are seen regardless of routing, netfilter/NAT, or
-forwarding (for example on a Docker host that DNATs the traffic to a container).
-This requires `CAP_NET_RAW`. By default it captures on all interfaces; restrict
-it with `--interface`:
+It captures packets at the device layer using `AF_PACKET` and requires
+`CAP_NET_RAW`. Capture uses all interfaces by default; select one with
+`--interface`:
 
 ```bash
 sudo udp-forward -l 0.0.0.0:5000 --silent --interface eth0 192.168.1.10:6000
 ```
 
-Limitations of silent mode: IP fragments are dropped rather than reassembled,
-and IPv6 packets with extension headers are not handled.
+Silent mode uses one worker. It drops IP fragments and does not handle IPv6
+extension headers. Combine `--silent` with `--spoof` to preserve sender addresses.
 
----
+## Logging
 
-### Run as a Service (systemd)
+Logs go to stderr by default. Set the log level with `RUST_LOG`:
 
-`udp-forward` runs in the foreground and exits non-zero if it cannot start or if a
-worker fails, so let systemd handle backgrounding, restarts, and logging:
-
-```ini
-# /etc/systemd/system/udp-forward.service
-[Unit]
-Description=UDP forwarder
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/udp-forward -l 0.0.0.0:5000 192.168.1.10:6000
-Environment=RUST_LOG=info
-Restart=on-failure
-DynamicUser=yes
-# Only needed for --spoof (CAP_NET_ADMIN) and/or --silent (CAP_NET_RAW):
-# AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-
-[Install]
-WantedBy=multi-user.target
+```bash
+RUST_LOG=info udp-forward -l 0.0.0.0:5000 192.168.1.10:6000
 ```
+
+Use `--logfile /path/to/file` to write logs to a file instead.
+
+## Run with systemd
+
+The example unit is in [udp-forward.service](udp-forward.service). It runs the
+forwarder in the foreground, restarts it on failure, and sends logs to the journal.
+
+After installing the binary, copy the unit and edit its `ExecStart` line to set
+your listening address and destinations:
+
+```bash
+sudo install -m 644 udp-forward.service /etc/systemd/system/udp-forward.service
+sudo systemctl edit --full udp-forward.service
+```
+
+If using `--spoof` or `--silent`, enable the corresponding capabilities in the
+unit's `AmbientCapabilities` setting, as shown in its comments.
+
+Start the service and enable it at boot:
 
 ```bash
 sudo systemctl daemon-reload
