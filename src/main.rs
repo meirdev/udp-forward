@@ -1,45 +1,46 @@
-use std::net::SocketAddr;
-use std::thread;
+use std::any::Any;
+use std::sync::mpsc;
+use std::{panic, thread};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nix::unistd::daemon;
-use socket2::{Domain, Protocol, Socket, Type};
 use udp_forward::cli::Args;
 use udp_forward::worker::Worker;
 
-fn is_port_in_use(addr: SocketAddr) -> bool {
-    let domain = if addr.is_ipv6() {
-        Domain::IPV6
+/// Configures logging from RUST_LOG, writing to stderr or the requested file.
+fn init_logger(logfile: Option<&std::path::Path>) -> Result<()> {
+    let mut builder = env_logger::Builder::from_default_env();
+
+    if let Some(path) = logfile {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("Failed to open log file {}", path.display()))?;
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+    }
+
+    builder.init();
+    Ok(())
+}
+
+/// The payload of an unwinding panic, as text.
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
     } else {
-        Domain::IPV4
-    };
-
-    let Ok(sock) = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)) else {
-        return false;
-    };
-
-    sock.bind(&addr.into()).is_err()
+        "unknown panic payload".to_string()
+    }
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
-
     let args = Args::parse();
 
-    if args.fork {
-        daemon(false, false).context("Failed to daemonize")?;
-    }
+    init_logger(args.logfile.as_deref())?;
 
-    if let Some(ref pidfile) = args.pidfile {
-        let pid = std::process::id();
-
-        std::fs::write(pidfile, pid.to_string())
-            .with_context(|| format!("Failed to write PID to {}", pidfile.display()))?;
-
-        log::info!("PID {} written to {}", pid, pidfile.display());
-    }
-
+    // Reject mixed address families before any worker binds a socket.
     let is_ipv6 = args.listen.is_ipv6();
     for dest in &args.destinations {
         if dest.is_ipv6() != is_ipv6 {
@@ -54,8 +55,9 @@ fn main() -> Result<()> {
 
     let workers = if args.silent && args.workers > 1 {
         log::warn!(
-            "Silent mode uses raw sockets which don't support multi-threading. \
-             Forcing single worker thread (requested: {})",
+            "Silent mode uses a single AF_PACKET capture socket; multiple \
+             workers would each receive a copy of every packet. Forcing single \
+             worker thread (requested: {})",
             args.workers
         );
         1
@@ -63,37 +65,32 @@ fn main() -> Result<()> {
         args.workers
     };
 
-    if !args.silent && is_port_in_use(args.listen) {
-        anyhow::bail!("Port {} is already in use", args.listen);
-    }
-
     log::info!("Config: {:?}", args);
     log::info!("Starting {} worker thread(s)", workers);
 
-    let mut handles = Vec::with_capacity(workers);
-
-    for i in 0..workers {
+    // Report setup errors, run errors, and unwinding panics through one channel.
+    // Keep panic handling at the thread boundary; normal failures use Result.
+    let (tx, rx) = mpsc::channel::<(usize, Result<()>)>();
+    for id in 0..workers {
         let args = args.clone();
-        let handle = thread::Builder::new()
-            .name(format!("worker-{}", i))
+        let tx = tx.clone();
+        thread::Builder::new()
+            .name(format!("worker-{}", id))
             .spawn(move || {
-                let worker = match Worker::new(&args) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        log::error!("Failed to create worker {}: {}", i, e);
-                        return;
-                    }
-                };
-                if let Err(e) = worker.run() {
-                    log::error!("Worker {} error: {}", i, e);
-                }
+                let outcome =
+                    panic::catch_unwind(|| Worker::new(&args)?.run()).unwrap_or_else(|payload| {
+                        Err(anyhow::anyhow!("panicked: {}", panic_message(payload)))
+                    });
+                let _ = tx.send((id, outcome));
             })?;
-        handles.push(handle);
     }
+    drop(tx);
 
-    for handle in handles {
-        handle.join().expect("Worker thread panicked");
+    // Any worker exit is fatal: do not leave the service running at reduced
+    // capacity.
+    match rx.recv() {
+        Ok((id, Ok(()))) => anyhow::bail!("Worker {} exited unexpectedly", id),
+        Ok((id, Err(e))) => Err(e).with_context(|| format!("Worker {} failed", id)),
+        Err(_) => anyhow::bail!("All workers exited without reporting an outcome"),
     }
-
-    Ok(())
 }
