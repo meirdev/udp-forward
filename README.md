@@ -1,5 +1,12 @@
 # udp-forward
 
+<div align="center">
+  <img src="logo.png" width="300" />
+</div>
+
+&nbsp;
+&nbsp;
+
 A lightweight UDP forwarder for Linux, written in Rust. Forward packets to one
 or more destinations, optionally preserving the original sender's address or
 capturing traffic without binding the listening port.
@@ -36,8 +43,7 @@ sudo udp-forward -l 0.0.0.0:5000 --spoof 192.168.1.10:6000
 ```
 
 The destination sees the original sender's IP and port. Spoofing uses transparent
-UDP sockets and requires `CAP_NET_ADMIN`. The network may still drop packets
-with a non-local source address.
+UDP sockets and requires `CAP_NET_ADMIN`.
 
 ### Capture without binding
 
