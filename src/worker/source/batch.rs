@@ -1,5 +1,5 @@
-//! Batched receive shared by the sources. One `recvmmsg` fills many buffers;
-//! callers then iterate the received datagrams.
+//! Receives batches with `recvmmsg` and exposes borrowed packet data and
+//! metadata.
 
 use std::io::IoSliceMut;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
@@ -45,13 +45,11 @@ impl BatchedReceiver {
         }
     }
 
-    /// Receives up to `RECV_BATCH_SIZE` datagrams with a single `recvmmsg` and
-    /// returns the count. `MSG_WAITFORONE` blocks for the first datagram, then
-    /// takes whatever else is already queued, so a low-rate stream is not
-    /// stalled waiting for a full batch.
+    /// Fills the buffers and returns the number of received packets.
+    /// `MSG_WAITFORONE` waits for the first packet, then drains queued packets
+    /// without waiting for a full batch. Interrupted calls are retried.
     pub(super) fn recv(&mut self, fd: RawFd) -> Result<usize> {
-        // EINTR is retried. The io-slices are rebuilt per attempt (cheap, and
-        // EINTR is rare) so no borrow of the buffers spans loop iterations.
+        // Reborrow the buffers on each attempt so retries do not retain slices.
         loop {
             let mut iovs: Vec<[IoSliceMut<'_>; 1]> = self
                 .bufs

@@ -7,8 +7,7 @@ use clap::Parser;
 use udp_forward::cli::Args;
 use udp_forward::worker::Worker;
 
-/// Logs go to stderr by default (where a service manager such as systemd
-/// collects them); `--logfile` redirects them to a file instead.
+/// Configures logging from RUST_LOG, writing to stderr or the requested file.
 fn init_logger(logfile: Option<&std::path::Path>) -> Result<()> {
     let mut builder = env_logger::Builder::from_default_env();
 
@@ -41,8 +40,7 @@ fn main() -> Result<()> {
 
     init_logger(args.logfile.as_deref())?;
 
-    // Validate the configuration before starting workers so a bad setup fails
-    // fast with a clear error and a non-zero exit.
+    // Reject mixed address families before any worker binds a socket.
     let is_ipv6 = args.listen.is_ipv6();
     for dest in &args.destinations {
         if dest.is_ipv6() != is_ipv6 {
@@ -70,9 +68,8 @@ fn main() -> Result<()> {
     log::info!("Config: {:?}", args);
     log::info!("Starting {} worker thread(s)", workers);
 
-    // Each worker sends exactly one termination result, whether initialization
-    // failed, forwarding failed, or the worker panicked. `catch_unwind` is used
-    // only here, at the thread boundary; ordinary failures stay as `Result`.
+    // Report setup errors, run errors, and unwinding panics through one channel.
+    // Keep panic handling at the thread boundary; normal failures use Result.
     let (tx, rx) = mpsc::channel::<(usize, Result<()>)>();
     for id in 0..workers {
         let args = args.clone();
@@ -89,8 +86,8 @@ fn main() -> Result<()> {
     }
     drop(tx);
 
-    // A worker stopping means lost capacity (or a failed start), so the first
-    // one ends the process with an error; a service manager can then restart it.
+    // Any worker exit is fatal: do not leave the service running at reduced
+    // capacity.
     match rx.recv() {
         Ok((id, Ok(()))) => anyhow::bail!("Worker {} exited unexpectedly", id),
         Ok((id, Err(e))) => Err(e).with_context(|| format!("Worker {} failed", id)),

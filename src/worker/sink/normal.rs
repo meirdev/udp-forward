@@ -1,5 +1,4 @@
-//! Normal send: forwards from the forwarder's own address via one shared
-//! socket.
+//! Sends through one UDP socket per worker, using a local source address.
 
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -11,7 +10,7 @@ use super::PacketSink;
 use super::batch::BatchedSender;
 use crate::worker::packet::{Datagram, SendReport};
 
-/// Forwards from the forwarder's own address via a single shared socket.
+/// A UDP socket and the destination set used for normal forwarding.
 pub(crate) struct NormalSink {
     socket: Socket,
     sender: BatchedSender,
@@ -38,7 +37,6 @@ impl PacketSink for NormalSink {
         if batch.is_empty() {
             return Ok(SendReport::default());
         }
-        // Everything goes out the one socket, so the whole batch is one fan-out.
         let payloads: Vec<&[u8]> = batch.iter().map(|d| d.payload).collect();
         self.sender.send(self.socket.as_raw_fd(), &payloads)
     }

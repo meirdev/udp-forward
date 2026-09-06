@@ -20,7 +20,7 @@ pub struct Args {
     #[arg(short, long)]
     pub listen: SocketAddr,
 
-    /// Spoof source IP (preserve original sender address)
+    /// Preserve the original sender IP and port
     #[arg(short, long)]
     pub spoof: bool,
 
@@ -34,15 +34,15 @@ pub struct Args {
     #[arg(short = 'i', long, requires = "silent")]
     pub interface: Option<String>,
 
-    /// TTL for outgoing packets
+    /// IPv4 TTL or IPv6 hop limit for outgoing packets
     #[arg(short = 'T', long, default_value_t = 64)]
     pub ttl: u8,
 
-    /// Number of worker threads
+    /// Number of worker threads (silent mode uses one)
     #[arg(short, long, default_value_t = num_cpus::get(), value_parser = parse_nonzero_usize)]
     pub workers: usize,
 
-    /// Receive buffer size in bytes
+    /// Bytes per packet buffer (does not set the kernel receive queue size)
     #[arg(short, long, default_value_t = 65536, value_parser = parse_nonzero_usize)]
     pub buffer_size: usize,
 

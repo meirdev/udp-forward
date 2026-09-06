@@ -1,5 +1,5 @@
-//! Spoof send: preserves each original sender's address via per-source
-//! transparent sockets (IP_TRANSPARENT / IPV6_TRANSPARENT).
+//! Preserves sender IPs and ports with UDP sockets bound to the original
+//! sources.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -13,12 +13,9 @@ use super::PacketSink;
 use super::batch::BatchedSender;
 use crate::worker::packet::{Datagram, SendReport};
 
-/// Forwards with each original sender's address preserved, via a per-source
-/// transparent socket bound to that address (IP_TRANSPARENT /
-/// IPV6_TRANSPARENT).
+/// A cache of transparent sockets sharing one destination set.
 pub(crate) struct SpoofSink {
-    // Keyed by original source address; each socket is bound to that address so
-    // the kernel emits packets with it as the source.
+    // Each socket is bound to its key and retained for the lifetime of this sink.
     cache: HashMap<SocketAddr, Socket>,
     sender: BatchedSender,
     ttl: u8,
@@ -26,7 +23,7 @@ pub(crate) struct SpoofSink {
 
 impl SpoofSink {
     pub(crate) fn new(destinations: &[SocketAddr], ttl: u8, is_ipv6: bool) -> Result<Self> {
-        // Validate all outgoing socket options before accepting traffic.
+        // Fail startup if required socket options cannot be set.
         drop(new_spoof_socket(is_ipv6, ttl)?);
 
         Ok(Self {
@@ -36,8 +33,8 @@ impl SpoofSink {
         })
     }
 
-    /// Returns the raw fd of the transparent socket bound to `src`, creating
-    /// and caching it on first use. `None` if the socket cannot be created.
+    /// Gets or creates the socket for `src`; logs setup errors and returns
+    /// `None`. The cache owns the returned descriptor.
     fn socket_for(&mut self, src: SocketAddr) -> Option<RawFd> {
         match self.cache.entry(src) {
             Entry::Occupied(entry) => Some(entry.get().as_raw_fd()),
@@ -78,15 +75,8 @@ impl PacketSink for SpoofSink {
     }
 }
 
-/// Creates a UDP socket bound to `src` that is allowed to send from that
-/// (possibly non-local) address.
-///
-/// Setting IP_TRANSPARENT (IPv4) / IPV6_TRANSPARENT (IPv6) lets the socket bind
-/// to an address that is not configured on the host, so the kernel emits
-/// packets whose source is the original sender. This replaces hand-built raw
-/// packets: the kernel fills in the headers, computes checksums, honors routing
-/// across real interfaces, and can use transmit offloads. Requires
-/// CAP_NET_ADMIN (root).
+/// Binds a transparent UDP socket to the original sender, including non-local
+/// addresses. The kernel supplies packet headers, checksums, and routing.
 fn make_spoof_socket(src: SocketAddr, ttl: u8) -> Result<Socket> {
     let sock = new_spoof_socket(src.is_ipv6(), ttl)?;
     sock.bind(&src.into())
@@ -101,8 +91,7 @@ fn new_spoof_socket(is_ipv6: bool, ttl: u8) -> Result<Socket> {
     let sock =
         Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create spoof socket")?;
 
-    // Allow multiple sockets on the same source port (e.g. several workers, or a
-    // local socket that already holds the port being spoofed).
+    // Permit sharing source ports with sockets that also enable port reuse.
     sock.set_reuse_address(true).context("set SO_REUSEADDR")?;
     sock.set_reuse_port(true).context("set SO_REUSEPORT")?;
 
@@ -125,6 +114,7 @@ fn new_spoof_socket(is_ipv6: bool, ttl: u8) -> Result<Socket> {
 /// variant directly).
 fn set_ipv6_transparent(sock: &Socket) -> Result<()> {
     let on: libc::c_int = 1;
+    // SAFETY: on is a live integer with the size expected by this option.
     let ret = unsafe {
         libc::setsockopt(
             sock.as_raw_fd(),

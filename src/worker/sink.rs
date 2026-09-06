@@ -1,8 +1,5 @@
-//! Packet sinks: how a batch of datagrams is forwarded to the destinations.
-//! [`NormalSink`] sends from the forwarder's own address; [`SpoofSink`]
-//! preserves each original sender's address via per-source transparent
-//! sockets. Both fan the batch out with `sendmmsg`, chunked to the kernel's
-//! per-call limit.
+//! Sends each input datagram to every configured destination, using the
+//! forwarder's address or preserving the original sender.
 
 mod batch;
 mod normal;
@@ -14,9 +11,8 @@ pub(crate) use spoof::SpoofSink;
 
 use crate::worker::packet::{Datagram, SendReport};
 
-/// Where packets go. Per-message send failures are counted in the returned
-/// report rather than raised; `Err` is reserved for a fatal socket error that
-/// makes the sink unusable.
+/// Forwards batches and reports output counts. Recoverable failures are counted
+/// as drops; fatal errors stop the worker and return no partial report.
 pub(crate) trait PacketSink {
     fn send_batch(&mut self, batch: &[Datagram]) -> Result<SendReport>;
 }

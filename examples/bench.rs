@@ -5,8 +5,8 @@
 //! bench recv <bind> <seconds>                  # count arrivals, report pps
 //! ```
 //!
-//! Both sides use `sendmmsg` / `recvmmsg` in batches of 64 so the tool itself
-//! is not the bottleneck when measuring the forwarder in the middle.
+//! Both sides batch up to 64 messages per syscall. Measure generator and
+//! receiver capacity separately before attributing a limit to the forwarder.
 
 use std::io;
 use std::net::SocketAddr;
@@ -114,8 +114,8 @@ fn recv(bind: SocketAddr, secs: u64) {
         Domain::IPV4
     };
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
-    // A large receive buffer so the counter itself never drops; we are
-    // measuring the forwarder, not this tool.
+    // Request extra queue space for bursts. Kernel limits may cap this request;
+    // a successful call does not guarantee a lossless receiver.
     sock.set_recv_buffer_size(64 << 20).expect("SO_RCVBUF");
     sock.set_read_timeout(Some(Duration::from_millis(250)))
         .expect("SO_RCVTIMEO");

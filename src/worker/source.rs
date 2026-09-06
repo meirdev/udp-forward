@@ -1,6 +1,5 @@
-//! Packet sources: how a batch of datagrams is received and each original
-//! source recovered. [`NormalSource`] binds a UDP socket; [`SilentSource`]
-//! captures at the device layer.
+//! Receives datagrams through a bound UDP socket or an AF_PACKET capture
+//! socket.
 
 mod batch;
 mod normal;
@@ -12,11 +11,10 @@ pub(crate) use silent::SilentSource;
 
 use crate::worker::packet::Datagram;
 
-/// Where packets come from: how datagrams are received and each original source
-/// recovered. Implementations decide the receive mechanism (a bound UDP socket
-/// vs. device-layer capture); callers only see a batch of [`Datagram`]s.
+/// Supplies datagrams with their original sender addresses.
 pub(crate) trait PacketSource {
-    /// Receives a batch of datagrams with a single `recvmmsg`. The returned
-    /// datagrams borrow internal buffers and are valid until the next call.
+    /// Waits for input and returns accepted datagrams borrowing internal
+    /// buffers. The batch can be empty if every received packet was
+    /// rejected.
     fn recv_batch(&mut self) -> Result<Vec<Datagram<'_>>>;
 }

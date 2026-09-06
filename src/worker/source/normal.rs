@@ -10,7 +10,7 @@ use super::PacketSource;
 use super::batch::{BatchedReceiver, source_addr};
 use crate::worker::packet::Datagram;
 
-/// Receives on a UDP socket bound to the listen address.
+/// A bound UDP socket and its reusable receive buffers.
 pub(crate) struct NormalSource {
     socket: Socket,
     rx: BatchedReceiver,

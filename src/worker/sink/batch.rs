@@ -1,11 +1,6 @@
-//! Batched send shared by the sinks: fans a batch of payloads out to every
-//! destination on a given socket with `sendmmsg`, in chunks of at most
-//! `MAX_MSGS_PER_CALL` messages.
-//!
-//! `libc::sendmmsg` is called directly rather than through nix: nix's result
-//! iterator reads a per-message address the send path never initializes, and
-//! the raw call returns how many messages were actually accepted, which the
-//! retry policy needs.
+//! Sends payloads to a fixed destination set in bounded `sendmmsg` chunks.
+//! Uses libc directly to obtain the accepted-message count without consuming
+//! nix's receive-oriented result iterator.
 
 use std::io;
 use std::net::SocketAddr;
@@ -19,14 +14,11 @@ use crate::worker::packet::{RECV_BATCH_SIZE, SendReport};
 // Linux caps a single sendmmsg at UIO_MAXIOV (1024) messages.
 const MAX_MSGS_PER_CALL: usize = 1024;
 
-/// Fans payloads out to a fixed destination set. Reused across sends, and
-/// across per-source sockets in the spoof sink (the destination set is the same
-/// for every source).
+/// Destination addresses and reusable descriptors for one outgoing chunk.
 pub(super) struct BatchedSender {
     dests: Vec<SockaddrStorage>,
-    // Scratch descriptors for one chunk. They hold raw pointers with no Rust
-    // lifetimes, so the allocations persist across calls and are refilled per
-    // chunk, bounding memory to one chunk rather than the whole fan-out.
+    // Pointer targets may expire between calls. Rebuild every descriptor before
+    // sending; never dereference a pointer left over from an earlier chunk.
     iovecs: Vec<libc::iovec>,
     msgs: Vec<libc::mmsghdr>,
 }
@@ -51,10 +43,9 @@ impl BatchedSender {
         self.dests.len()
     }
 
-    /// Sends every payload to every destination via `fd`. Message `m` carries
-    /// payload `m / destinations` to destination `m % destinations`.
-    /// Per-message failures are counted in the report; `Err` means a fatal
-    /// socket error.
+    /// Sends one copy of each payload to each destination.
+    /// Recoverable failures count as drops. Fatal errors return no partial
+    /// report.
     pub(super) fn send(&mut self, fd: RawFd, payloads: &[&[u8]]) -> Result<SendReport> {
         let ndests = self.dests.len();
         if payloads.is_empty() || ndests == 0 {
@@ -81,7 +72,9 @@ impl BatchedSender {
         })
     }
 
-    /// Fills the scratch descriptors for messages `[next, end)`.
+    /// Builds messages `[next, end)` in payload order, then destination order.
+    /// With `n` destinations, message `m` uses payload `m / n` and destination
+    /// `m % n`.
     fn build_chunk(&mut self, payloads: &[&[u8]], next: usize, end: usize) {
         let ndests = self.dests.len();
 
@@ -117,14 +110,12 @@ impl BatchedSender {
 
 /// Drives chunked sends over `total` messages.
 ///
-/// `send_chunk(next, end)` attempts messages `[next, end)` and returns how many
-/// the kernel accepted, or the error for the message at `next`. Policy:
-/// - `EINTR`: retry the same chunk.
-/// - `EBADF` / `ENOTSOCK`: the socket is unusable; return `Err`.
-/// - any other error: the message at `next` cannot be sent; skip it.
-/// - partial completion: advance past the accepted messages and retry from the
-///   next one, so its error (if any) surfaces on the following call. Linux
-///   explicitly permits retrying after a partial `sendmmsg`.
+/// The callback attempts `[next, end)` and returns an accepted count within
+/// that range or a send error.
+///
+/// Retry interruptions and continue after partial completion. An unusable
+/// socket aborts the operation; other errors skip one message. A zero count
+/// also skips one message to ensure progress.
 fn run_send_loop<F>(total: usize, mut send_chunk: F) -> Result<SendReport>
 where
     F: FnMut(usize, usize) -> io::Result<usize>,

@@ -1,5 +1,6 @@
-//! Silent receive: an AF_PACKET capture socket that taps at the device layer,
-//! like tcpdump, plus the in-kernel BPF filter and packet parsing it needs.
+//! Captures IP packets without binding a UDP port. BPF filters by protocol and
+//! port; userspace validates lengths, destination addresses, and interface
+//! scope.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
@@ -16,14 +17,13 @@ use super::PacketSource;
 use super::batch::BatchedReceiver;
 use crate::worker::packet::Datagram;
 
-// Fixed IPv6 header length (no extension headers). libc has no constant for it.
+// IPv6 base header size, excluding extension headers.
 const IPV6_HEADER_LEN: usize = 40;
 const UDP_HEADER_LEN: usize = 8;
 
 const SO_ATTACH_FILTER: libc::c_int = 26;
 
-/// Captures at the device layer with an AF_PACKET socket and reconstructs the
-/// source from the packet headers. Sees traffic regardless of routing or NAT.
+/// A capture socket and buffers for extracting UDP datagrams from IP packets.
 pub(crate) struct SilentSource {
     socket: Socket,
     rx: BatchedReceiver,
@@ -60,12 +60,8 @@ impl SilentSource {
 
 impl PacketSource for SilentSource {
     fn recv_batch(&mut self) -> Result<Vec<Datagram<'_>>> {
-        // AF_PACKET SOCK_DGRAM delivers each packet starting at the IP header
-        // (the link-layer header is stripped in cooked mode). The BPF filter
-        // drops non-UDP and wrong-port packets in the kernel; the parser here
-        // enforces the listen address, rejects fragments and malformed lengths,
-        // and reconstructs the source (the capture address is the interface,
-        // not the datagram's sender).
+        // Cooked capture data starts at the IP header. The receive address
+        // describes the capture interface; the sender comes from the packet.
         let n = self.rx.recv(self.socket.as_raw_fd())?;
 
         let mut batch = Vec::with_capacity(n);
@@ -93,8 +89,7 @@ fn capture_ifindex(addr: Option<SockaddrStorage>) -> Option<u32> {
     addr.and_then(|a| a.as_link_addr().map(|l| l.ifindex() as u32))
 }
 
-/// A scoped IPv6 listen address only accepts datagrams captured on that
-/// interface; an unscoped or IPv4 listen address accepts any interface.
+/// Checks the listen scope against the capture interface, if a scope is set.
 fn listen_scope_matches(listen: SocketAddr, capture_ifindex: Option<u32>) -> bool {
     match listen {
         SocketAddr::V6(l) if l.scope_id() != 0 => capture_ifindex == Some(l.scope_id()),
@@ -102,9 +97,8 @@ fn listen_scope_matches(listen: SocketAddr, capture_ifindex: Option<u32>) -> boo
     }
 }
 
-/// A link-local IPv6 source is only meaningful with its interface scope, which
-/// the packet itself does not carry; take it from where the packet was
-/// captured.
+/// Adds a missing link-local scope from capture metadata when available.
+/// Interface scope is not encoded in the IP header.
 fn attach_link_local_scope(src: &mut SocketAddr, capture_ifindex: Option<u32>) {
     if let SocketAddr::V6(v6) = src
         && is_link_local_v6(*v6.ip())
@@ -120,14 +114,9 @@ fn is_link_local_v6(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
-/// Creates an AF_PACKET capture socket for silent mode.
-///
-/// This taps at the device layer, exactly like tcpdump, so packets are seen
-/// regardless of routing, netfilter/NAT rules, or forwarding decisions (for
-/// example a Docker host that DNATs or forwards the traffic to a container).
-/// A raw `IPPROTO_UDP` socket, by contrast, only receives packets the kernel
-/// routes for local delivery, which misses that traffic. Requires CAP_NET_RAW
-/// (root).
+/// Opens a filtered AF_PACKET socket, optionally restricted to an interface.
+/// Capture sees incoming packets before IP routing and NAT, including traffic
+/// headed to containers. Requires CAP_NET_RAW.
 fn new_capture_socket(is_ipv6: bool, interface: Option<&str>, listen_port: u16) -> Result<Socket> {
     let ethertype = if is_ipv6 {
         libc::ETH_P_IPV6
@@ -144,9 +133,7 @@ fn new_capture_socket(is_ipv6: bool, interface: Option<&str>, listen_port: u16) 
     )
     .context("create AF_PACKET capture socket")?;
 
-    // Drop non-matching packets in the kernel. SOCK_DGRAM delivers cooked
-    // frames, so the filter (like the read) sees the packet starting at the IP
-    // header on every interface type, making these fixed offsets portable.
+    // BPF offsets are relative to the IP header in cooked capture mode.
     if is_ipv6 {
         attach_bpf_filter(&sock, &create_bpf_filter_ipv6(listen_port))?;
     } else {
@@ -180,6 +167,7 @@ fn new_capture_socket(is_ipv6: bool, interface: Option<&str>, listen_port: u16) 
 /// Resolves an interface name to its index.
 fn ifindex_of(iface: &str) -> Result<u32> {
     let cname = std::ffi::CString::new(iface).context("interface name has interior NUL")?;
+    // SAFETY: cname is a live, NUL-terminated interface name.
     let ifindex = unsafe { libc::if_nametoindex(cname.as_ptr()) };
     if ifindex == 0 {
         return Err(std::io::Error::last_os_error())
@@ -188,14 +176,16 @@ fn ifindex_of(iface: &str) -> Result<u32> {
     Ok(ifindex)
 }
 
-/// Binds an AF_PACKET socket to a single interface by index, the supported way
-/// to restrict a packet socket's capture to one interface.
+/// Restricts capture using sockaddr_ll; packet sockets do not use
+/// SO_BINDTODEVICE.
 fn bind_to_interface(sock: &Socket, ethertype: u16, iface: &str) -> Result<()> {
+    // SAFETY: all sockaddr_ll fields accept zero initialization.
     let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     sll.sll_family = libc::AF_PACKET as u16;
     sll.sll_protocol = ethertype.to_be();
     sll.sll_ifindex = ifindex_of(iface)? as i32;
 
+    // SAFETY: sll has the AF_PACKET layout and remains valid during bind.
     let ret = unsafe {
         libc::bind(
             sock.as_raw_fd(),
@@ -211,21 +201,17 @@ fn bind_to_interface(sock: &Socket, ethertype: u16, iface: &str) -> Result<()> {
     Ok(())
 }
 
-/// The validated IP layer of a captured packet.
+/// IP header fields used by the UDP parser. Length bounds are checked there.
 struct IpEnvelope {
     header_len: usize,
-    /// Length of the IP packet itself; captured bytes beyond it are link-layer
-    /// padding and must never be read as payload.
+    /// Declared IP packet length, excluding any trailing link-layer padding.
     total: usize,
     src: IpAddr,
     dst: IpAddr,
 }
 
-/// Validates an IPv4 header and confirms it carries an unfragmented UDP
-/// datagram. Packet sockets do not reassemble fragments: a fragment has a
-/// non-zero offset or the More Fragments flag, only its first piece carries a
-/// UDP header, and that header's length covers the whole datagram, so
-/// forwarding any fragment would emit corrupted data.
+/// Extracts IPv4 fields for unfragmented UDP. Rejects all fragments because
+/// capture sockets do not reassemble them into complete datagrams.
 fn parse_ipv4(data: &[u8]) -> Option<IpEnvelope> {
     let ip = Ipv4Packet::new(data)?;
     if ip.get_version() != 4 {
@@ -250,8 +236,8 @@ fn parse_ipv4(data: &[u8]) -> Option<IpEnvelope> {
     })
 }
 
-/// Validates an IPv6 header and confirms UDP follows it directly. Extension
-/// headers (including fragments) are not reassembled; such packets are dropped.
+/// Extracts IPv6 fields when UDP follows the base header directly.
+/// Packets with extension headers, including fragment headers, are unsupported.
 fn parse_ipv6(data: &[u8]) -> Option<IpEnvelope> {
     let ip = Ipv6Packet::new(data)?;
     if ip.get_version() != 6 {
@@ -268,10 +254,9 @@ fn parse_ipv6(data: &[u8]) -> Option<IpEnvelope> {
     })
 }
 
-/// Parses a captured IP + UDP packet into a [`Datagram`] when it is a UDP
-/// datagram addressed to `listen`. Enforces the listen port always and the
-/// listen IP unless it is the wildcard address. Bounds all UDP parsing by the
-/// IP-declared length so link-layer padding is never read as payload.
+/// Returns a borrowed UDP datagram matching the listen IP and port. Wildcard
+/// IPs match any destination; interface scope is checked by the caller.
+/// Validates IP and UDP lengths, but does not verify checksums.
 fn parse_captured_udp(data: &[u8], listen: SocketAddr) -> Option<Datagram<'_>> {
     let ip = if listen.is_ipv6() {
         parse_ipv6(data)?
@@ -332,6 +317,8 @@ fn attach_bpf_filter(socket: &Socket, filter: &[SockFilter]) -> Result<()> {
         filter: filter.as_ptr(),
     };
 
+    // SAFETY: prog has the sock_fprog layout; it and its filter slice remain
+    // valid while setsockopt copies the program into the kernel.
     let ret = unsafe {
         libc::setsockopt(
             socket.as_raw_fd(),
@@ -349,10 +336,9 @@ fn attach_bpf_filter(socket: &Socket, filter: &[SockFilter]) -> Result<()> {
     Ok(())
 }
 
-/// Classic BPF that accepts UDP datagrams with destination `port`, assuming the
-/// data starts at the IPv4 header. Valid for AF_PACKET SOCK_DGRAM, which
-/// delivers cooked (link-layer-stripped) frames, so this works on any
-/// interface.
+/// Filters cooked IPv4 captures by protocol and UDP destination port.
+/// Userspace still checks fragment flags, packet lengths, and the destination
+/// IP.
 const fn create_bpf_filter_ipv4(port: u16) -> [SockFilter; 7] {
     [
         // Load byte at offset 9 (IPv4 protocol field).
@@ -390,7 +376,7 @@ const fn create_bpf_filter_ipv4(port: u16) -> [SockFilter; 7] {
             jf: 1,
             k: port as u32,
         },
-        // Accept (return full packet).
+        // Accept up to 65,535 bytes.
         SockFilter {
             code: 0x06,
             jt: 0,
@@ -407,10 +393,9 @@ const fn create_bpf_filter_ipv4(port: u16) -> [SockFilter; 7] {
     ]
 }
 
-/// Classic BPF that accepts UDP datagrams with destination `port`, assuming the
-/// data starts at a 40-byte IPv6 header with no extension headers. Packets with
-/// extension headers have a non-UDP next-header value, so they are dropped in
-/// the kernel and never delivered (silent mode does not reassemble them).
+/// Filters cooked IPv6 captures with UDP directly after the base header.
+/// Extension headers are rejected here, so those packets never reach the
+/// parser.
 const fn create_bpf_filter_ipv6(port: u16) -> [SockFilter; 6] {
     [
         // Load byte at offset 6 (IPv6 Next Header field).

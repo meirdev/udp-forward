@@ -4,9 +4,7 @@ use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-/// Owns a spawned forwarder and kills **and reaps** it on drop, including
-/// during a panicking assertion, so no test leaves a zombie or a lingering
-/// process.
+/// Kills and reaps the child on drop, including when a test panics.
 struct Forwarder(Child);
 
 impl Drop for Forwarder {
@@ -16,10 +14,8 @@ impl Drop for Forwarder {
     }
 }
 
-/// Binds a sender socket with SO_REUSEPORT so it can coexist with the
-/// forwarder's IP_TRANSPARENT spoof socket, which binds the same source
-/// address to preserve it. Real senders are remote, so no such collision
-/// occurs; this only matters for the loopback simulation used in these tests.
+/// Allows the local test sender and the forwarder's spoof socket to bind the
+/// same source address. Remote senders do not create this local bind conflict.
 fn reuseport_sender(bind: &str) -> UdpSocket {
     let addr: SocketAddr = bind.parse().expect("valid bind address");
     let domain = if addr.is_ipv6() {

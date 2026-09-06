@@ -1,8 +1,6 @@
-//! A worker wires one [`PacketSource`] (how packets are received) to one
-//! [`PacketSink`] (how they are forwarded). The two concerns are independent:
-//! receiving normally or silently, and sending normally or spoofed, combine
-//! freely. Work flows in batches: one `recvmmsg` fills a batch, and the sink
-//! fans it out with `sendmmsg`.
+//! Connects a packet source to a sink and forwards borrowed datagrams in
+//! batches. Receive mode (UDP socket or capture) and send mode (normal or
+//! spoofed) are selected independently.
 
 mod packet;
 mod sink;
@@ -48,8 +46,8 @@ impl Worker {
         Ok(Self { source, sink })
     }
 
-    /// Runs until a fatal source or sink error. Per-message send failures are
-    /// summarized per batch rather than logged individually.
+    /// Forwards batches until a source or sink returns an error.
+    /// Logs a summary when a completed batch includes dropped output messages.
     pub fn run(mut self) -> Result<()> {
         loop {
             let batch = self.source.recv_batch()?;

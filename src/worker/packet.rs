@@ -1,25 +1,25 @@
-//! The unit of work passed from a source to a sink.
+//! Borrowed datagrams and send outcomes shared by sources, sinks, and workers.
 
 use std::net::SocketAddr;
 
-/// Datagrams received per `recvmmsg`. The outgoing message count is this times
-/// the number of destinations, and is chunked separately by the sinks.
+/// Maximum datagrams per receive call. Sinks chunk output messages separately.
 pub(crate) const RECV_BATCH_SIZE: usize = 16;
 
-/// One received UDP datagram: its original source and payload. The payload
-/// borrows the source's receive buffer and is valid until the source produces
-/// its next batch.
+/// A UDP payload and its original sender. The payload borrows a receive buffer.
 pub(crate) struct Datagram<'a> {
     pub(crate) src: SocketAddr,
     pub(crate) payload: &'a [u8],
 }
 
-/// What happened to a batch handed to a sink.
+/// Output counts for a completed send operation, counting each destination
+/// copy. A fatal send error returns no report, even if earlier messages were
+/// sent.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SendReport {
-    /// Messages the kernel accepted.
+    /// Messages accepted by the local kernel; delivery is not confirmed.
     pub(crate) sent: usize,
-    /// Messages skipped after a non-fatal send error.
+    /// Output copies skipped during socket setup or sending.
+    /// Excludes receive-side rejection and kernel queue drops.
     pub(crate) dropped: usize,
 }
 
