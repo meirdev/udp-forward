@@ -37,9 +37,9 @@ impl Worker {
             )?)
         } else {
             Box::new(NormalSink::new(
-                args.listen.is_ipv6(),
                 &args.destinations,
                 args.ttl,
+                args.listen.is_ipv6(),
             )?)
         };
 

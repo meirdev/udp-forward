@@ -17,7 +17,7 @@ pub(crate) struct NormalSink {
 }
 
 impl NormalSink {
-    pub(crate) fn new(is_ipv6: bool, destinations: &[SocketAddr], ttl: u8) -> Result<Self> {
+    pub(crate) fn new(destinations: &[SocketAddr], ttl: u8, is_ipv6: bool) -> Result<Self> {
         let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
         if is_ipv6 {
