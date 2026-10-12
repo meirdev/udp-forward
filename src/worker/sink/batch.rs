@@ -24,6 +24,8 @@ pub(super) struct BatchedSender {
 }
 
 impl BatchedSender {
+    /// Prepares descriptors sized for one receive batch fanned out to every
+    /// destination.
     pub(super) fn new(destinations: &[SocketAddr]) -> Self {
         let chunk = destinations
             .len()

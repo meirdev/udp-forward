@@ -3,12 +3,13 @@
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 
-use anyhow::Result;
-use socket2::{Domain, Protocol, Socket, Type};
+use anyhow::{Context, Result};
+use socket2::{Protocol, Socket, Type};
 
 use super::PacketSink;
 use super::batch::BatchedSender;
 use crate::worker::packet::{Datagram, SendReport};
+use crate::worker::socket::domain_for;
 
 /// A UDP socket and the destination set used for normal forwarding.
 pub(crate) struct NormalSink {
@@ -17,13 +18,16 @@ pub(crate) struct NormalSink {
 }
 
 impl NormalSink {
+    /// Opens the sending socket. Fails if the TTL cannot be set.
     pub(crate) fn new(destinations: &[SocketAddr], ttl: u8, is_ipv6: bool) -> Result<Self> {
-        let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
-        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        let socket = Socket::new(domain_for(is_ipv6), Type::DGRAM, Some(Protocol::UDP))
+            .context("create sending socket")?;
         if is_ipv6 {
-            socket.set_unicast_hops_v6(ttl as u32)?;
+            socket
+                .set_unicast_hops_v6(ttl as u32)
+                .context("set IPv6 hop limit")?;
         } else {
-            socket.set_ttl_v4(ttl as u32)?;
+            socket.set_ttl_v4(ttl as u32).context("set IPv4 TTL")?;
         }
         Ok(Self {
             socket,

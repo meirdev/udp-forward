@@ -16,7 +16,7 @@ fn init_logger(logfile: Option<&std::path::Path>) -> Result<()> {
             .create(true)
             .append(true)
             .open(path)
-            .with_context(|| format!("Failed to open log file {}", path.display()))?;
+            .with_context(|| format!("open log file {}", path.display()))?;
         builder.target(env_logger::Target::Pipe(Box::new(file)));
     }
 
@@ -90,7 +90,7 @@ fn main() -> Result<()> {
     // capacity.
     match rx.recv() {
         Ok((id, Ok(()))) => anyhow::bail!("Worker {} exited unexpectedly", id),
-        Ok((id, Err(e))) => Err(e).with_context(|| format!("Worker {} failed", id)),
+        Ok((id, Err(e))) => Err(e).with_context(|| format!("worker {} failed", id)),
         Err(_) => anyhow::bail!("All workers exited without reporting an outcome"),
     }
 }

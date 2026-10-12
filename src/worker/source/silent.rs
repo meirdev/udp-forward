@@ -2,6 +2,7 @@
 //! port; userspace validates lengths, destination addresses, and interface
 //! scope.
 
+use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 
@@ -16,6 +17,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use super::PacketSource;
 use super::batch::BatchedReceiver;
 use crate::worker::packet::Datagram;
+use crate::worker::socket::set_raw_option;
 
 // IPv6 base header size, excluding extension headers.
 const IPV6_HEADER_LEN: usize = 40;
@@ -31,6 +33,8 @@ pub(crate) struct SilentSource {
 }
 
 impl SilentSource {
+    /// Opens a filtered capture socket for the listen port, optionally bound
+    /// to one interface.
     pub(crate) fn new(
         listen: SocketAddr,
         interface: Option<&str>,
@@ -67,7 +71,7 @@ impl PacketSource for SilentSource {
         let mut batch = Vec::with_capacity(n);
         for received in self.rx.received() {
             if received.truncated {
-                log::debug!("Silent: dropping truncated capture (increase --buffer-size)");
+                log::debug!("Dropping truncated capture (increase --buffer-size)");
                 continue;
             }
             let ifindex = capture_ifindex(received.addr);
@@ -170,7 +174,7 @@ fn ifindex_of(iface: &str) -> Result<u32> {
     // SAFETY: cname is a live, NUL-terminated interface name.
     let ifindex = unsafe { libc::if_nametoindex(cname.as_ptr()) };
     if ifindex == 0 {
-        return Err(std::io::Error::last_os_error())
+        return Err(io::Error::last_os_error())
             .with_context(|| format!("unknown interface {}", iface));
     }
     Ok(ifindex)
@@ -194,7 +198,7 @@ fn bind_to_interface(sock: &Socket, ethertype: u16, iface: &str) -> Result<()> {
         )
     };
     if ret < 0 {
-        return Err(std::io::Error::last_os_error())
+        return Err(io::Error::last_os_error())
             .with_context(|| format!("bind capture to interface {}", iface));
     }
 
@@ -225,7 +229,7 @@ fn parse_ipv4(data: &[u8]) -> Option<IpEnvelope> {
         return None;
     }
     if ip.get_fragment_offset() != 0 || (ip.get_flags() & Ipv4Flags::MoreFragments) != 0 {
-        log::debug!("Silent: dropping IPv4 fragment from {}", ip.get_source());
+        log::debug!("Dropping IPv4 fragment from {}", ip.get_source());
         return None;
     }
     Some(IpEnvelope {
@@ -311,29 +315,14 @@ struct SockFprog {
     filter: *const SockFilter,
 }
 
+/// Attaches a classic BPF program. The kernel copies the instructions during
+/// the call, so `filter` need not outlive it.
 fn attach_bpf_filter(socket: &Socket, filter: &[SockFilter]) -> Result<()> {
     let prog = SockFprog {
         len: filter.len() as u16,
         filter: filter.as_ptr(),
     };
-
-    // SAFETY: prog has the sock_fprog layout; it and its filter slice remain
-    // valid while setsockopt copies the program into the kernel.
-    let ret = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            SO_ATTACH_FILTER,
-            &prog as *const _ as *const libc::c_void,
-            std::mem::size_of::<SockFprog>() as libc::socklen_t,
-        )
-    };
-
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-
-    Ok(())
+    set_raw_option(socket, libc::SOL_SOCKET, SO_ATTACH_FILTER, &prog).context("attach BPF filter")
 }
 
 /// Filters cooked IPv4 captures by protocol and UDP destination port.

@@ -4,6 +4,7 @@
 
 mod packet;
 mod sink;
+mod socket;
 mod source;
 
 use anyhow::Result;
@@ -18,7 +19,11 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// Opens the source and sink selected by `args`. Fails if either cannot
+    /// be set up.
     pub fn new(args: &Args) -> Result<Self> {
+        let is_ipv6 = args.listen.is_ipv6();
+
         let source: Box<dyn PacketSource> = if args.silent {
             Box::new(SilentSource::new(
                 args.listen,
@@ -30,17 +35,9 @@ impl Worker {
         };
 
         let sink: Box<dyn PacketSink> = if args.spoof {
-            Box::new(SpoofSink::new(
-                &args.destinations,
-                args.ttl,
-                args.listen.is_ipv6(),
-            )?)
+            Box::new(SpoofSink::new(&args.destinations, args.ttl, is_ipv6)?)
         } else {
-            Box::new(NormalSink::new(
-                &args.destinations,
-                args.ttl,
-                args.listen.is_ipv6(),
-            )?)
+            Box::new(NormalSink::new(&args.destinations, args.ttl, is_ipv6)?)
         };
 
         Ok(Self { source, sink })

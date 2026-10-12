@@ -24,6 +24,7 @@ pub(crate) struct SendReport {
 }
 
 impl SendReport {
+    /// Adds another operation's counts to this report.
     pub(crate) fn merge(&mut self, other: SendReport) {
         self.sent += other.sent;
         self.dropped += other.dropped;

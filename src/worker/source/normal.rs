@@ -4,11 +4,12 @@ use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 
 use anyhow::{Context, Result};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Protocol, Socket, Type};
 
 use super::PacketSource;
 use super::batch::{BatchedReceiver, source_addr};
 use crate::worker::packet::Datagram;
+use crate::worker::socket::domain_for;
 
 /// A bound UDP socket and its reusable receive buffers.
 pub(crate) struct NormalSource {
@@ -17,17 +18,18 @@ pub(crate) struct NormalSource {
 }
 
 impl NormalSource {
+    /// Binds `listen` with port reuse so every worker shares the port.
     pub(crate) fn new(listen: SocketAddr, buffer_size: usize) -> Result<Self> {
-        let domain = if listen.is_ipv6() {
-            Domain::IPV6
-        } else {
-            Domain::IPV4
-        };
-        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-        socket.set_reuse_port(true)?;
+        let socket = Socket::new(
+            domain_for(listen.is_ipv6()),
+            Type::DGRAM,
+            Some(Protocol::UDP),
+        )
+        .context("create listen socket")?;
+        socket.set_reuse_port(true).context("set SO_REUSEPORT")?;
         socket
             .bind(&listen.into())
-            .with_context(|| format!("Failed to bind listen address {listen}"))?;
+            .with_context(|| format!("bind listen address {}", listen))?;
         Ok(Self {
             socket,
             rx: BatchedReceiver::new(buffer_size),

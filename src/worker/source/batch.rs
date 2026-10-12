@@ -37,6 +37,7 @@ pub(super) struct BatchedReceiver {
 }
 
 impl BatchedReceiver {
+    /// Allocates one `buffer_size` buffer per batch slot.
     pub(super) fn new(buffer_size: usize) -> Self {
         Self {
             bufs: vec![vec![0u8; buffer_size]; RECV_BATCH_SIZE],

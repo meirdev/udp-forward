@@ -7,11 +7,12 @@ use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 
 use anyhow::{Context, Result};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Protocol, Socket, Type};
 
 use super::PacketSink;
 use super::batch::BatchedSender;
 use crate::worker::packet::{Datagram, SendReport};
+use crate::worker::socket::{domain_for, set_raw_option};
 
 /// A cache of transparent sockets sharing one destination set.
 pub(crate) struct SpoofSink {
@@ -22,6 +23,8 @@ pub(crate) struct SpoofSink {
 }
 
 impl SpoofSink {
+    /// Verifies that transparent sockets can be configured. Sockets for each
+    /// source are created on demand.
     pub(crate) fn new(destinations: &[SocketAddr], ttl: u8, is_ipv6: bool) -> Result<Self> {
         // Fail startup if required socket options cannot be set.
         drop(new_spoof_socket(is_ipv6, ttl)?);
@@ -86,10 +89,8 @@ fn make_spoof_socket(src: SocketAddr, ttl: u8) -> Result<Socket> {
 
 /// Configures a transparent socket; binding the original source is separate.
 fn new_spoof_socket(is_ipv6: bool, ttl: u8) -> Result<Socket> {
-    let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
-
-    let sock =
-        Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create spoof socket")?;
+    let sock = Socket::new(domain_for(is_ipv6), Type::DGRAM, Some(Protocol::UDP))
+        .context("create spoof socket")?;
 
     // Permit sharing source ports with sockets that also enable port reuse.
     sock.set_reuse_address(true).context("set SO_REUSEADDR")?;
@@ -114,20 +115,6 @@ fn new_spoof_socket(is_ipv6: bool, ttl: u8) -> Result<Socket> {
 /// variant directly).
 fn set_ipv6_transparent(sock: &Socket) -> Result<()> {
     let on: libc::c_int = 1;
-    // SAFETY: on is a live integer with the size expected by this option.
-    let ret = unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::IPPROTO_IPV6,
-            libc::IPV6_TRANSPARENT,
-            &on as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-
+    set_raw_option(sock, libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT, &on)?;
     Ok(())
 }
