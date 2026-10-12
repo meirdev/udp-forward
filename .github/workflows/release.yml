@@ -13,23 +13,30 @@ jobs:
     permissions:
       contents: write
 
-    runs-on: ubuntu-latest
-
     strategy:
       matrix:
-        BUILD_TARGET: [x86_64-unknown-linux-musl]
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Add the musl target
-        run: rustup target add ${{ matrix.BUILD_TARGET }}
+        run: rustup target add ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.BUILD_TARGET }}
+        run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Update binaries to release
+      - name: Name the binary by target
+        run: cp target/${{ matrix.target }}/release/udp-forward udp-forward-${{ matrix.target }}
+
+      - name: Upload binary to release
         uses: softprops/action-gh-release@v2
         if: github.ref_type == 'tag'
         with:
-          files: target/${{ matrix.BUILD_TARGET }}/release/udp-forward
+          files: udp-forward-${{ matrix.target }}
